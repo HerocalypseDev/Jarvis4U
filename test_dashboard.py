@@ -1,0 +1,530 @@
+"""QA regression suite for jarvis_dashboard.py. Run with: python -m pytest test_dashboard.py -v
+
+Uses a temporary sqlite DB (via JARVIS_MEMORY_DB_PATH) so this never touches the real
+jarvis_memory.db, and FastAPI's TestClient (real ASGI routing, real WebSocket handling —
+not mocked HTTP).
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import tempfile
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture()
+def db_path(monkeypatch, tmp_path):
+    path = tmp_path / "test_jarvis_memory.db"
+    monkeypatch.setenv("JARVIS_MEMORY_DB_PATH", str(path))
+    return path
+
+
+@pytest.fixture()
+def dashboard(db_path):
+    import importlib
+    import jarvis_dashboard as dashboard_module
+
+    importlib.reload(dashboard_module)  # picks up the monkeypatched JARVIS_MEMORY_DB_PATH
+    return dashboard_module
+
+
+@pytest.fixture()
+def client(dashboard):
+    from fastapi.testclient import TestClient
+
+    app = dashboard._build_app()
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        yield c
+
+
+def test_state_shape_empty_db(client):
+    r = client.get("/api/state")
+    assert r.status_code == 200
+    data = r.json()
+    assert sorted(data.keys()) == sorted(
+        ["pending_action", "sessions", "tasks", "audit", "victory_log", "counts", "metrics", "tool_names"]
+    )
+    assert data["pending_action"] is None
+    assert data["sessions"] == []
+    assert data["tasks"] == []
+    assert data["metrics"] is None
+
+
+def test_static_index_served(client):
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "JARVIS" in r.text
+    assert "metrics-strip" in r.text
+    assert "view-audit" in r.text  # UI overhaul (2026-09-22): routed views replaced tab panels
+    assert "compose-form" in r.text
+
+
+def test_static_assets_served(client):
+    assert client.get("/app.js").status_code == 200
+    assert client.get("/style.css").status_code == 200
+
+
+def test_session_bookkeeping_round_trip(dashboard, client):
+    sid = dashboard.start_session("voice", "hello jarvis")
+    assert sid is not None
+    dashboard.end_session(sid, "done", "hi there")
+
+    r = client.get("/api/state")
+    sessions = r.json()["sessions"]
+    match = [s for s in sessions if s["id"] == sid]
+    assert len(match) == 1
+    assert match[0]["source"] == "voice"
+    assert match[0]["status"] == "done"
+    assert match[0]["reply"] == "hi there"
+
+
+def test_end_session_with_none_id_is_noop(dashboard):
+    dashboard.end_session(None, "done", "reply")  # must not raise
+
+
+def test_pending_action_endpoints_501_when_not_wired(client):
+    assert client.post("/api/pending/approve").status_code == 501
+    assert client.post("/api/pending/reject").status_code == 501
+
+
+def test_pending_action_approve_reject_wired(dashboard):
+    from fastapi.testclient import TestClient
+
+    calls = {"approved": 0, "rejected": 0}
+    app = dashboard._build_app(
+        get_pending=lambda: {"tool_name": "run_shell", "tool_input": {"command": "x"}, "reason": "y"},
+        approve_pending=lambda: (calls.__setitem__("approved", calls["approved"] + 1), "ok")[1],
+        reject_pending=lambda: (calls.__setitem__("rejected", calls["rejected"] + 1), True)[1],
+    )
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        r = c.get("/api/state")
+        assert r.json()["pending_action"]["tool_name"] == "run_shell"
+
+        r = c.post("/api/pending/approve")
+        assert r.status_code == 200 and r.json() == {"ok": True, "reply": "ok"}
+        assert calls["approved"] == 1
+
+        r = c.post("/api/pending/reject")
+        assert r.status_code == 200 and r.json() == {"ok": True}
+        assert calls["rejected"] == 1
+
+
+def test_stop_task_501_when_not_wired(client):
+    assert client.post("/api/tasks/bg-1/stop").status_code == 501
+
+
+def test_stop_task_id_parsing(dashboard):
+    from fastapi.testclient import TestClient
+
+    killed = []
+    app = dashboard._build_app(kill_background_task=lambda tid: killed.append(tid) or f"stopped {tid}")
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        r = c.post("/api/tasks/bg-42/stop")
+        assert r.status_code == 200
+        assert killed == [42]
+
+        r = c.post("/api/tasks/tq-7/stop")
+        assert r.status_code == 400
+
+        r = c.post("/api/tasks/rem-3/stop")
+        assert r.status_code == 400
+
+        r = c.post("/api/tasks/bg-notanumber/stop")
+        assert r.status_code == 400
+
+
+def test_command_endpoint_501_when_not_wired(client):
+    r = client.post("/api/command", json={"text": "do something"})
+    assert r.status_code == 501
+
+
+def test_command_endpoint_rejects_empty_text(dashboard):
+    from fastapi.testclient import TestClient
+
+    app = dashboard._build_app(run_command=lambda text, sink: None)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        r = c.post("/api/command", json={"text": "   "})
+        assert r.status_code == 400
+        r = c.post("/api/command", json={})
+        assert r.status_code == 400
+
+
+def test_command_endpoint_invokes_run_command(dashboard):
+    import threading
+    from fastapi.testclient import TestClient
+
+    received = {}
+    done = threading.Event()
+
+    def fake_run_command(text, sink):
+        received["text"] = text
+        sink("the reply")
+        done.set()
+
+    app = dashboard._build_app(run_command=fake_run_command)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        r = c.post("/api/command", json={"text": "turn on the lights"})
+        assert r.status_code == 200 and r.json() == {"ok": True}
+        assert done.wait(timeout=5)
+        assert received["text"] == "turn on the lights"
+
+
+def test_audit_filters(dashboard, db_path):
+    conn = sqlite3.connect(dashboard._db_path())
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS action_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "timestamp TEXT NOT NULL, transcript TEXT NOT NULL, tool_name TEXT NOT NULL, "
+        "tool_input TEXT NOT NULL, result TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO action_audit (timestamp, transcript, tool_name, tool_input, result) "
+        "VALUES (?,?,?,?,?)",
+        ("2020-01-01T00:00:00", "t1", "web_search", '{"q":"cats"}', "found cats"),
+    )
+    conn.execute(
+        "INSERT INTO action_audit (timestamp, transcript, tool_name, tool_input, result) "
+        "VALUES (?,?,?,?,?)",
+        ("2020-01-02T00:00:00", "t2", "open_app", '{"app":"notepad"}', "Opened notepad."),
+    )
+    conn.commit()
+    conn.close()
+
+    from fastapi.testclient import TestClient
+
+    app = dashboard._build_app()
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        r = c.get("/api/audit")
+        assert len(r.json()["rows"]) == 2
+
+        r = c.get("/api/audit", params={"tool_name": "web_search"})
+        rows = r.json()["rows"]
+        assert len(rows) == 1 and rows[0]["tool_name"] == "web_search"
+
+        r = c.get("/api/audit", params={"q": "cats"})
+        assert len(r.json()["rows"]) == 1
+
+        r = c.get("/api/audit", params={"transcript": "t2"})
+        assert len(r.json()["rows"]) == 1
+
+        r = c.get("/api/audit", params={"date_from": "2020-01-02T00:00:00"})
+        assert len(r.json()["rows"]) == 1
+
+        r = c.get("/api/audit", params={"date_to": "2020-01-01T23:59:59"})
+        assert len(r.json()["rows"]) == 1
+
+        state = c.get("/api/state").json()
+        assert set(state["tool_names"]) == {"web_search", "open_app"}
+
+
+def test_state_audit_rows_include_transcript_for_session_linking(dashboard, db_path):
+    """Post-overhaul UX audit (2026-09-22): the Activity route's rows come from /api/state's
+    compact audit list (_fetch_audit), not /api/audit's filtered one (_fetch_audit_filtered) —
+    the frontend links an audit row to its session by an exact transcript match, so a row with no
+    transcript field can never link even when a real session shares its transcript. _fetch_audit
+    was missing the column entirely."""
+    conn = sqlite3.connect(dashboard._db_path())
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS action_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "timestamp TEXT NOT NULL, transcript TEXT NOT NULL, tool_name TEXT NOT NULL, "
+        "tool_input TEXT NOT NULL, result TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO action_audit (timestamp, transcript, tool_name, tool_input, result) "
+        "VALUES (?,?,?,?,?)",
+        ("2020-01-01T00:00:00", "what time is it", "get_time", "{}", "It's noon."),
+    )
+    conn.commit()
+    conn.close()
+
+    from fastapi.testclient import TestClient
+
+    app = dashboard._build_app()
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        r = c.get("/api/state")
+        rows = r.json()["audit"]
+        assert len(rows) == 1
+        assert rows[0]["transcript"] == "what time is it"
+
+
+def test_metrics_passthrough(dashboard):
+    from fastapi.testclient import TestClient
+
+    fake_metrics = {"cpu": {"overall_percent": 12.0}}
+    app = dashboard._build_app(get_system_status=lambda: fake_metrics)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        r = c.get("/api/state")
+        assert r.json()["metrics"] == fake_metrics
+
+
+def test_metrics_callback_exception_does_not_break_state(dashboard):
+    from fastapi.testclient import TestClient
+
+    def boom():
+        raise RuntimeError("psutil exploded")
+
+    app = dashboard._build_app(get_system_status=boom)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        r = c.get("/api/state")
+        assert r.status_code == 200
+        assert r.json()["metrics"] is None
+
+
+def test_get_pending_exception_does_not_break_state(dashboard):
+    from fastapi.testclient import TestClient
+
+    def boom():
+        raise RuntimeError("lock exploded")
+
+    app = dashboard._build_app(get_pending=boom)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        r = c.get("/api/state")
+        assert r.status_code == 200
+        assert r.json()["pending_action"] is None
+
+
+def test_websocket_broadcast(dashboard):
+    from fastapi.testclient import TestClient
+
+    app = dashboard._build_app()
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        with c.websocket_connect("/ws") as ws:
+            dashboard.notify({"type": "ping", "data": {"x": 1}})
+            msg = ws.receive_json()
+            assert msg == {"type": "ping", "data": {"x": 1}}
+
+
+def test_notify_before_server_started_is_noop(dashboard):
+    dashboard._broadcast_fn = None
+    dashboard.notify({"type": "irrelevant"})  # must not raise
+
+
+def test_services_endpoint_empty_when_not_wired(client):
+    r = client.get("/api/services")
+    assert r.status_code == 200
+    assert r.json() == {"services": []}
+
+
+def test_services_endpoint_wired(dashboard):
+    from fastapi.testclient import TestClient
+
+    fake_services = [
+        {"name": "gmail", "status": "connected", "detail": "5 tool(s)"},
+        {"name": "calendar", "status": "failed", "detail": "retrying every 2 min"},
+    ]
+    app = dashboard._build_app(get_services=lambda: fake_services)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        r = c.get("/api/services")
+        assert r.status_code == 200
+        assert r.json()["services"] == fake_services
+
+
+def test_services_endpoint_exception_does_not_break(dashboard):
+    from fastapi.testclient import TestClient
+
+    def boom():
+        raise RuntimeError("mcp lock exploded")
+
+    app = dashboard._build_app(get_services=boom)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        r = c.get("/api/services")
+        assert r.status_code == 200
+        assert r.json() == {"services": []}
+
+
+def test_session_pruning_keeps_table_bounded(dashboard):
+    original_max = dashboard.MAX_SESSION_ROWS
+    dashboard.MAX_SESSION_ROWS = 5
+    try:
+        ids = [dashboard.start_session("voice", f"command {i}") for i in range(10)]
+        conn = sqlite3.connect(dashboard._db_path())
+        count = conn.execute("SELECT COUNT(*) FROM dashboard_sessions").fetchone()[0]
+        conn.close()
+        assert count == 5
+        # the most recent ones must be the ones kept, not an arbitrary subset
+        assert dashboard.start_session is not None
+        assert ids[-1] is not None
+    finally:
+        dashboard.MAX_SESSION_ROWS = original_max
+
+
+def test_clear_finished_sessions(dashboard, client):
+    active_id = dashboard.start_session("voice", "still running")
+    done_id = dashboard.start_session("text", "already done")
+    dashboard.end_session(done_id, "done", "ok")
+
+    removed = dashboard.clear_finished_sessions()
+    assert removed == 1
+
+    r = client.get("/api/state")
+    sessions = r.json()["sessions"]
+    ids = [s["id"] for s in sessions]
+    assert active_id in ids
+    assert done_id not in ids
+
+
+def test_clear_finished_sessions_endpoint(dashboard, client):
+    done_id = dashboard.start_session("voice", "finished one")
+    dashboard.end_session(done_id, "done", "ok")
+
+    r = client.request("DELETE", "/api/sessions/finished")
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    assert r.json()["removed"] >= 1
+
+
+def test_daily_endpoint_empty_when_not_wired(client):
+    r = client.get("/api/daily")
+    assert r.status_code == 200
+    assert r.json() == {"items": []}
+
+
+def test_daily_endpoint_wired(dashboard):
+    from fastapi.testclient import TestClient
+
+    fake_items = [
+        {"kind": "skill", "name": "morning_briefing", "description": "", "schedule": "daily at 08:00", "last_run_at": "2026-09-18T08:00:00"},
+        {"kind": "reminder", "name": "drink water", "description": "", "schedule": "every 60 min", "last_run_at": None, "next_due": "2026-09-18T09:00:00"},
+    ]
+    app = dashboard._build_app(get_daily=lambda: fake_items)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        r = c.get("/api/daily")
+        assert r.status_code == 200
+        assert r.json()["items"] == fake_items
+
+
+def test_daily_endpoint_exception_does_not_break(dashboard):
+    from fastapi.testclient import TestClient
+
+    def boom():
+        raise RuntimeError("skills dir exploded")
+
+    app = dashboard._build_app(get_daily=boom)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        r = c.get("/api/daily")
+        assert r.status_code == 200
+        assert r.json() == {"items": []}
+
+
+def test_usage_endpoint_empty_when_not_wired(client):
+    r = client.get("/api/usage")
+    assert r.status_code == 200
+    assert r.json() == {"usage": None}
+
+
+def test_usage_endpoint_wired_and_exception_safe(dashboard):
+    from fastapi.testclient import TestClient
+
+    fake = {"periods": {"today": {"cost_usd": 0.42}}, "daily": [], "by_model": []}
+    with TestClient(dashboard._build_app(get_usage=lambda: fake), base_url="http://127.0.0.1:8765") as c:
+        assert c.get("/api/usage").json() == {"usage": fake}
+
+    def boom():
+        raise RuntimeError("db locked")
+
+    with TestClient(dashboard._build_app(get_usage=boom), base_url="http://127.0.0.1:8765") as c:
+        r = c.get("/api/usage")
+        assert r.status_code == 200 and r.json() == {"usage": None}
+
+
+def test_sleep_endpoint_empty_wired_and_exception_safe(client, dashboard):
+    from fastapi.testclient import TestClient
+
+    assert client.get("/api/sleep").json() == {"sleep": None}
+    fake = {"goal_hours": 8, "daily": []}
+    with TestClient(dashboard._build_app(get_sleep=lambda: fake), base_url="http://127.0.0.1:8765") as c:
+        assert c.get("/api/sleep").json() == {"sleep": fake}
+
+    def boom():
+        raise RuntimeError("db locked")
+
+    with TestClient(dashboard._build_app(get_sleep=boom), base_url="http://127.0.0.1:8765") as c:
+        r = c.get("/api/sleep")
+        assert r.status_code == 200 and r.json() == {"sleep": None}
+
+
+# --- QOL pass (2026-09-23): Settings + command palette ------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _private_environ(monkeypatch):
+    # set_setting writes os.environ directly; give each test a throwaway copy so nothing leaks
+    # into later tests (a leaked JARVIS_WEATHER_UNITS=f broke test_qol's weather test once).
+    monkeypatch.setattr(os, "environ", os.environ.copy())
+
+
+def test_settings_list_masks_secrets_and_set_writes_env(client, monkeypatch, tmp_path):
+    import jarvis_settings
+    env = tmp_path / ".env"
+    env.write_text("ANTHROPIC_API_KEY=sk-real-secret\nJARVIS_WEATHER_UNITS=c\nMY_FLAG=hello\n", encoding="utf-8")
+    monkeypatch.setenv("JARVIS_ENV_PATH", str(env))
+    monkeypatch.delenv("JARVIS_WEATHER_UNITS", raising=False)
+    monkeypatch.delenv("MY_FLAG", raising=False)
+    data = client.get("/api/settings").json()
+    assert "sk-real-secret" not in str(data)  # secrets are never sent to the browser
+    other = {o["key"]: o for o in data["other"]}
+    assert other["ANTHROPIC_API_KEY"] == {"key": "ANTHROPIC_API_KEY", "secret": True, "set": True, "value": None}
+    assert other["MY_FLAG"]["value"] == "hello"
+    r = client.post("/api/settings", json={"key": "JARVIS_WEATHER_UNITS", "value": "f"})
+    assert r.status_code == 200 and r.json()["applies"] == "now"
+    assert "JARVIS_WEATHER_UNITS=f" in env.read_text() and os.environ["JARVIS_WEATHER_UNITS"] == "f"
+    assert "ANTHROPIC_API_KEY=sk-real-secret" in env.read_text()  # other lines untouched
+    assert client.post("/api/settings", json={"key": "JARVIS_WEATHER_UNITS", "value": "kelvin"}).status_code == 400
+    assert client.post("/api/settings", json={"key": "bad key", "value": "x"}).status_code == 400
+    assert client.post("/api/settings", json={"key": "MY_FLAG", "value": "a\nEVIL=1"}).status_code == 400
+    r = client.post("/api/settings", json={"key": "NEW_THING", "value": "42"})
+    assert r.json()["applies"] == "restart" and "NEW_THING=42" in env.read_text()
+    monkeypatch.delenv("NEW_THING", raising=False)
+
+
+def test_settings_live_apply_updates_module_value(monkeypatch, tmp_path):
+    import types
+    import jarvis_settings
+    env = tmp_path / ".env"
+    monkeypatch.setenv("JARVIS_ENV_PATH", str(env))
+    fake = types.SimpleNamespace(SMART_MODEL="claude-sonnet-5", followup=types.SimpleNamespace(window_s=5.0))
+    monkeypatch.setattr(jarvis_settings, "JARVIS_MODULE", fake)
+    assert jarvis_settings.set_setting("JARVIS_SMART_MODEL", "")["applies"] == "now"
+    assert fake.SMART_MODEL == ""
+    jarvis_settings.set_setting("JARVIS_FOLLOWUP_S", "0")
+    assert fake.followup.window_s == 0.0
+    monkeypatch.delenv("JARVIS_SMART_MODEL", raising=False)
+    monkeypatch.delenv("JARVIS_FOLLOWUP_S", raising=False)
+
+
+def test_settings_hide_phone_topics_and_refuse_modifier_selection_keys(client, monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("NTFY_TOPIC=my-private-topic\nTELEGRAM_CHAT_ID=12345\n", encoding="utf-8")
+    monkeypatch.setenv("JARVIS_ENV_PATH", str(env))
+    assert "my-private-topic" not in str(client.get("/api/settings").json())
+    assert "12345" not in str(client.get("/api/settings").json())
+    for bad in ("right shift", "left alt", "windows"):
+        assert client.post("/api/settings", json={"key": "JARVIS_SELECTION_KEY", "value": bad}).status_code == 400
+    assert not (tmp_path / ".env.tmp").exists()
+
+
+def test_settings_post_requires_local_origin(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_ENV_PATH", str(tmp_path / ".env"))
+    r = client.post("/api/settings", json={"key": "X_Y", "value": "1"}, headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403
+
+
+def test_recent_commands_for_palette(client, dashboard):
+    for t in ("what's the weather", "open youtube", "what's the weather"):
+        dashboard.start_session("text", t)
+    cmds = client.get("/api/commands/recent").json()["commands"]
+    assert [c["text"] for c in cmds][:2] == ["what's the weather", "open youtube"]
+    assert cmds[0]["count"] == 2
+
+
+def test_briefing_route_uses_registered_provider(client, monkeypatch):
+    import jarvis_dashboard
+    monkeypatch.setattr(jarvis_dashboard, "providers", {})
+    assert client.get("/api/briefing").status_code == 501
+    seen = []
+    monkeypatch.setitem(jarvis_dashboard.providers, "briefing",
+                        lambda kind: seen.append(kind) or {"kind": kind, "sections": [], "speech": "ok"})
+    assert client.get("/api/briefing?kind=morning").json()["kind"] == "morning"
+    assert client.get("/api/briefing?kind=anything").json()["kind"] == "urgent"
+    assert client.get("/api/briefing", headers={"Host": "evil.example"}).status_code == 403

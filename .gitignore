@@ -1,0 +1,32 @@
+.env
+.cache/
+.jarvis_tasks/
+jarvis_memory.db
+session_state.json
+proactive_suggestions.log
+mcp_servers.json
+__pycache__/
+*.pyc
+.claude/*.lock
+.playwright-mcp/
+jarvis_memory.db.corrupted-*.bak
+*.png
+llm_provider.json
+jarvis_standalone.log
+jarvis_python.txt
+
+# face recognition data lives outside the repo; this is a belt-and-braces guard
+face.db*
+face.key
+
+# run logs (contain transcripts and third-party addresses)
+*.log
+.env.tmp
+evals/results/
+
+# private words the public export must block (tools/export_public.py)
+public_export_denylist.txt
+
+# public repo extras
+skills/*.json
+public_export_denylist.txt

@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Jarvis Dashboard</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <button class="sidebar-toggle-btn" id="sidebar-toggle-btn" title="Collapse/expand sidebar" aria-label="Toggle sidebar">&#9776;</button>
+  <div class="brand">JARVIS <span class="brand-sub">Supervision</span></div>
+  <div id="approval-queue" class="approval-queue">
+    <span class="approval-empty">No pending confirmations</span>
+  </div>
+  <div id="input-mode-chip" class="input-mode-chip">idle</div>
+  <div id="llm-chip" class="input-mode-chip llm-chip" title="Which AI brain answers — click to switch">brain: &hellip;</div>
+  <div id="spend-chip" class="input-mode-chip spend-chip" title="Estimated Claude spend today (Jarvis only) — click for details">$&ndash; today</div>
+  <div class="services-dropdown">
+    <button class="btn btn-ghost" id="palette-btn" title="Command palette (Alt+K)">&#8984; Alt+K</button>
+    <button class="btn btn-ghost" id="services-toggle-btn">Services &#9662;</button>
+    <div id="services-panel" class="services-panel hidden">
+      <p class="muted">Loading&hellip;</p>
+    </div>
+  </div>
+  <div id="conn-status" class="conn-status offline">connecting&hellip;</div>
+</header>
+
+<div id="metrics-strip" class="metrics-strip"></div>
+<div id="load-error" class="load-error hidden" role="alert">
+  <span id="load-error-text">Can't reach Jarvis &mdash; showing the last data I had.</span>
+  <button class="btn btn-small" id="load-error-retry" type="button">Retry</button>
+</div>
+
+<div class="app-body">
+  <aside class="sidebar" id="sidebar">
+    <nav class="nav" id="nav">
+      <a href="#/home" data-route="home" class="nav-link"><span class="nav-icon">&#8962;</span><span class="nav-label">Home</span></a>
+      <a href="#/sessions" data-route="sessions" class="nav-link"><span class="nav-icon">&#9679;</span><span class="nav-label">Sessions</span></a>
+      <a href="#/tasks" data-route="tasks" class="nav-link"><span class="nav-icon">&#9776;</span><span class="nav-label">Tasks</span></a>
+      <a href="#/autonomy" data-route="autonomy" class="nav-link"><span class="nav-icon">&#9672;</span><span class="nav-label">Autonomy</span></a>
+      <a href="#/identity" data-route="identity" class="nav-link"><span class="nav-icon">&#9788;</span><span class="nav-label">Identity</span></a>
+      <a href="#/sleep" data-route="sleep" class="nav-link"><span class="nav-icon">&#9789;</span><span class="nav-label">Sleep</span></a>
+      <a href="#/usage" data-route="usage" class="nav-link"><span class="nav-icon">$</span><span class="nav-label">Usage</span></a>
+      <a href="#/activity" data-route="activity" class="nav-link"><span class="nav-icon">&#9673;</span><span class="nav-label">Activity</span></a>
+      <a href="#/audit" data-route="audit" class="nav-link"><span class="nav-icon">&#128269;</span><span class="nav-label">Audit Trail</span></a>
+      <a href="#/victory" data-route="victory" class="nav-link"><span class="nav-icon">&#10003;</span><span class="nav-label">Victory Log</span></a>
+      <a href="#/daily" data-route="daily" class="nav-link"><span class="nav-icon">&#8635;</span><span class="nav-label">Daily</span></a>
+      <a href="#/voice" data-route="voice" class="nav-link"><span class="nav-icon">&#127908;</span><span class="nav-label">Voice</span></a>
+      <a href="#/memory" data-route="memory" class="nav-link"><span class="nav-icon">&#10070;</span><span class="nav-label">Memory</span></a>
+      <a href="#/toolbox" data-route="toolbox" class="nav-link"><span class="nav-icon">&#9874;</span><span class="nav-label">Toolbox</span></a>
+      <a href="#/settings" data-route="settings" class="nav-link"><span class="nav-icon">&#9881;</span><span class="nav-label">Settings</span></a>
+    </nav>
+  </aside>
+
+  <main id="view">
+    <section id="view-home" class="view">
+      <div class="view-head"><h1 class="view-title">Home</h1></div>
+      <div id="home-alerts" class="home-alerts"></div>
+      <div class="home-block home-compose">
+        <h3 class="block-title">Send a command</h3>
+        <form id="home-compose-form" class="compose-form">
+          <input type="text" id="home-compose-input" placeholder="Send a command to Jarvis&hellip;" autocomplete="off" />
+          <button class="btn btn-primary" type="submit">Send</button>
+        </form>
+        <p id="home-compose-status" class="muted compose-status"></p>
+      </div>
+      <div class="home-block home-briefing">
+        <div class="briefing-head">
+          <h3 class="block-title">Briefing</h3>
+          <div class="briefing-controls">
+            <button class="btn btn-ghost briefing-kind active" data-kind="urgent" type="button">What's urgent</button>
+            <button class="btn btn-ghost briefing-kind" data-kind="morning" type="button">Full briefing</button>
+            <button class="btn btn-ghost" id="briefing-refresh" type="button" title="Refresh">&#8635;</button>
+          </div>
+        </div>
+        <div id="home-briefing" aria-live="polite"><span class="skeleton-line w-80" aria-hidden="true"></span><span class="skeleton-line w-60" aria-hidden="true"></span><span class="sr-only">Loading&hellip;</span></div>
+      </div>
+      <div class="home-block home-plan">
+        <div class="briefing-head">
+          <h3 class="block-title">Today's plan</h3>
+          <div class="briefing-controls">
+            <button class="btn btn-ghost" id="plan-refresh" type="button" title="Rebuild today's plan">Rebuild</button>
+          </div>
+        </div>
+        <ol id="home-plan" class="list compact plan-list" aria-live="polite"><li class="skeleton" aria-hidden="true"></li><li class="skeleton" aria-hidden="true"></li></ol>
+        <p id="home-plan-review" class="muted"></p>
+      </div>
+      <div class="home-grid">
+        <div class="home-block">
+          <div class="briefing-head">
+            <h3 class="block-title">Health</h3>
+            <button class="btn btn-ghost" id="safe-mode-btn" type="button" aria-pressed="false">Safe mode: off</button>
+          </div>
+          <div id="home-health" class="usage-cards"></div>
+          <ul id="home-health-status" class="list compact health-status"></ul>
+        </div>
+        <div class="home-block">
+          <h3 class="block-title">Needs you</h3>
+          <ul id="home-needs" class="list compact"><li class="skeleton" aria-hidden="true"></li><li class="skeleton" aria-hidden="true"></li></ul>
+        </div>
+        <div class="home-block">
+          <h3 class="block-title">Now</h3>
+          <ul id="home-now" class="list compact"><li class="skeleton" aria-hidden="true"></li><li class="skeleton" aria-hidden="true"></li></ul>
+        </div>
+        <div class="home-block">
+          <h3 class="block-title">Today</h3>
+          <div id="home-today" class="usage-cards"></div>
+        </div>
+        <div class="home-block">
+          <h3 class="block-title">Recent sessions</h3>
+          <ul id="home-recent-sessions" class="list compact"><li class="skeleton" aria-hidden="true"></li><li class="skeleton" aria-hidden="true"></li></ul>
+        </div>
+        <div class="home-block">
+          <h3 class="block-title">Recent autonomy activity</h3>
+          <ul id="home-recent-autonomy" class="list compact"><li class="skeleton" aria-hidden="true"></li><li class="skeleton" aria-hidden="true"></li></ul>
+        </div>
+        <div class="home-block">
+          <h3 class="block-title">Voice speed</h3>
+          <p id="home-latency" class="muted">No voice commands yet.</p>
+        </div>
+        <div class="home-block">
+          <div class="briefing-head">
+            <h3 class="block-title">Network devices</h3>
+            <span id="home-network-meta" class="muted"></span>
+          </div>
+          <ul id="home-network" class="list compact"><li class="muted">Scanning&hellip;</li></ul>
+        </div>
+        <div class="home-block">
+          <h3 class="block-title">Presence</h3>
+          <p id="home-presence" class="muted"></p>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-sessions" class="view">
+      <div class="view-head">
+        <h1 class="view-title">Sessions</h1>
+        <button class="btn btn-ghost btn-small" id="clear-sessions-btn">Clear finished</button>
+      </div>
+      <form id="compose-form" class="compose-form">
+        <input type="text" id="compose-input" placeholder="Send a command to Jarvis&hellip;" autocomplete="off" />
+        <button class="btn btn-primary" type="submit">Send</button>
+      </form>
+      <p id="compose-status" class="muted compose-status"></p>
+      <ul id="sessions-list" class="list"><li class="skeleton" aria-hidden="true"></li><li class="skeleton" aria-hidden="true"></li></ul>
+    </section>
+
+    <section id="view-tasks" class="view">
+      <div class="view-head"><h1 class="view-title">Tasks</h1></div>
+      <ul id="tasks-list" class="list"><li class="skeleton" aria-hidden="true"></li><li class="skeleton" aria-hidden="true"></li></ul>
+    </section>
+
+    <section id="view-autonomy" class="view">
+      <div class="view-head"><h1 class="view-title">Autonomy</h1></div>
+      <div id="autonomy-root"><span class="skeleton-line w-80" aria-hidden="true"></span><span class="skeleton-line w-60" aria-hidden="true"></span><span class="sr-only">Loading&hellip;</span></div>
+    </section>
+
+    <section id="view-identity" class="view">
+      <div class="view-head"><h1 class="view-title">Identity</h1></div>
+      <div class="identity-head">
+        <span id="identity-status" class="muted"></span>
+        <button class="btn btn-small" id="identity-pause-btn" hidden>Pause camera</button>
+        <button class="btn btn-small" id="identity-away-btn" hidden title="Lock the computer if I can't see you for a while">Away mode: off</button>
+      </div>
+      <div id="identity-cards" class="usage-cards"></div>
+      <div id="identity-profile"></div>
+      <h4 class="sleep-sub">Unknown visitors <span id="identity-snap-count" class="muted"></span>
+        <button class="btn btn-small btn-danger" id="identity-snap-delete" hidden>Delete all pictures</button></h4>
+      <div id="identity-snaps" class="snap-grid"></div>
+      <h4 class="sleep-sub">Recognition events
+        <select id="identity-kind"><option value="">All events</option></select></h4>
+      <ul id="identity-events" class="list compact"></ul>
+      <p id="identity-note" class="muted"></p>
+    </section>
+
+    <section id="view-sleep" class="view">
+      <div class="view-head"><h1 class="view-title">Sleep</h1></div>
+      <div class="sleep-head">
+        <div class="seg" role="group" aria-label="Sleep range">
+          <button class="seg-btn active" data-range="7">Week</button>
+          <button class="seg-btn" data-range="30">Month</button>
+        </div>
+        <span id="sleep-current" class="muted"></span>
+      </div>
+      <div id="sleep-cards" class="usage-cards"></div>
+      <div class="sleep-charts">
+        <figure class="sleep-fig"><figcaption>Hours slept per night <span class="muted">(dashed = goal)</span> <span class="sleep-legend"><i class="sw sw-bed"></i>night <i class="sw sw-nap"></i>nap</span></figcaption><div id="sleep-hours"></div></figure>
+        <figure class="sleep-fig"><figcaption>Bedtime &amp; wake time
+          <span class="sleep-legend"><i class="sw sw-bed"></i>bedtime <i class="sw sw-wake"></i>wake</span></figcaption><div id="sleep-times"></div></figure>
+        <figure class="sleep-fig"><figcaption>Average by weekday <span class="muted">(last 90 days)</span></figcaption><div id="sleep-weekday"></div></figure>
+      </div>
+      <h4 class="sleep-sub">While you were asleep</h4>
+      <ul id="sleep-digests" class="list compact"></ul>
+      <p id="sleep-note" class="muted"></p>
+    </section>
+
+    <section id="view-usage" class="view">
+      <div class="view-head"><h1 class="view-title">Usage</h1></div>
+      <div id="usage-cards" class="usage-cards"></div>
+      <div class="usage-lower">
+        <div id="usage-chart" class="usage-chart" aria-label="Daily spend, last 14 days"></div>
+        <ul id="usage-models" class="list compact"></ul>
+      </div>
+      <h4 class="sleep-sub">Tokens &amp; cache savings by period</h4>
+      <div id="usage-tokens" class="usage-token-grid"></div>
+      <p id="usage-note" class="muted"></p>
+    </section>
+
+    <section id="view-activity" class="view">
+      <div class="view-head"><h1 class="view-title">Activity</h1></div>
+      <ul id="activity-list" class="list compact"><li class="skeleton" aria-hidden="true"></li><li class="skeleton" aria-hidden="true"></li></ul>
+    </section>
+
+    <section id="view-audit" class="view">
+      <div class="view-head"><h1 class="view-title">Audit Trail</h1></div>
+      <div class="audit-filters">
+        <input type="date" id="audit-date-from" title="From date" />
+        <input type="date" id="audit-date-to" title="To date" />
+        <select id="audit-tool"><option value="">All tools</option></select>
+        <input type="text" id="audit-q" placeholder="Search input/result&hellip;" />
+        <button class="btn" id="audit-apply-btn">Filter</button>
+        <button class="btn btn-ghost" id="audit-clear-btn">Clear</button>
+      </div>
+      <ul id="audit-list" class="list compact"></ul>
+    </section>
+
+    <section id="view-victory" class="view">
+      <div class="view-head"><h1 class="view-title">Victory Log</h1></div>
+      <div id="victory-counts" class="victory-counts"></div>
+      <ul id="victory-list" class="list compact"><li class="skeleton" aria-hidden="true"></li><li class="skeleton" aria-hidden="true"></li></ul>
+    </section>
+
+    <section id="view-daily" class="view">
+      <div class="view-head"><h1 class="view-title">Daily</h1></div>
+      <ul id="daily-list" class="list compact"></ul>
+    </section>
+
+    <section id="view-voice" class="view">
+      <div class="view-head"><h1 class="view-title">Voice</h1></div>
+      <p class="muted">How much Jarvis says out loud (text-to-speech) and how much of what you say it transcribes
+        (speech-to-text). Only lengths are counted, never the words. Cached sentences replay saved audio and
+        cost the engine nothing.</p>
+      <div id="voice-cards" class="usage-cards voice-cards"></div>
+      <div id="voice-highlights" class="usage-cards voice-cards"></div>
+      <div class="home-block voice-block">
+        <h3 class="block-title">Characters per day, last 30 days</h3>
+        <div class="voice-chart-head"><span><i class="voice-swatch voice-bar-tts"></i>Sent to TTS engines (cache replays not counted)</span><span id="voice-daily-tts-max" class="muted"></span></div>
+        <div id="voice-daily-tts" class="voice-daily" role="img" aria-label="Characters Jarvis spoke per day"></div>
+        <div class="voice-chart-head"><span><i class="voice-swatch voice-bar-stt"></i>You said (speech-to-text)</span><span id="voice-daily-stt-max" class="muted"></span></div>
+        <div id="voice-daily-stt" class="voice-daily" role="img" aria-label="Characters you said per day"></div>
+      </div>
+      <div class="voice-grid">
+        <div class="home-block"><h3 class="block-title">Text-to-speech engines (30 days)</h3><div id="voice-engines-tts"></div></div>
+        <div class="home-block"><h3 class="block-title">Speech-to-text engines (30 days)</h3><div id="voice-engines-stt"></div></div>
+        <div class="home-block"><h3 class="block-title">When you use voice (hour of day)</h3>
+          <div id="voice-hours" class="voice-hours" role="img" aria-label="Voice activity by hour of day"></div>
+          <h3 class="block-title voice-sub">By weekday</h3><div id="voice-weekdays"></div></div>
+        <div class="home-block"><h3 class="block-title">Records</h3><ul id="voice-records" class="list compact"></ul></div>
+        <div class="home-block"><h3 class="block-title">Response speed</h3><div id="voice-latency"></div></div>
+        <div class="home-block"><h3 class="block-title">This month's split</h3><div id="voice-split"></div></div>
+      </div>
+    </section>
+
+    <section id="view-memory" class="view">
+      <div class="view-head"><h1 class="view-title">Memory</h1></div>
+      <p class="muted">What Jarvis remembers about you. Editing keeps the old wording as history; Forget deletes a fact and its older versions for good.
+        Relationship facts with an email address also decide who Sleep Mode answers.</p>
+      <h2 class="settings-h">About me</h2>
+      <div id="memory-profile" class="settings-list"></div>
+      <form id="memory-profile-form" class="settings-add">
+        <input id="memory-profile-key" placeholder="name, e.g. home_town" maxlength="60" required aria-label="Profile field name">
+        <input id="memory-profile-value" placeholder="value" maxlength="500" required aria-label="Profile field value">
+        <button class="btn btn-primary" type="submit">Save</button>
+      </form>
+      <h2 class="settings-h">Facts</h2>
+      <form id="memory-add-form" class="settings-add">
+        <select id="memory-add-category" aria-label="Category"></select>
+        <input id="memory-add-content" placeholder="Something Jarvis should remember" maxlength="1000" required aria-label="New fact">
+        <button class="btn btn-primary" type="submit">Remember</button>
+        <span id="memory-status" class="muted" aria-live="polite"></span>
+      </form>
+      <div class="memory-filter">
+        <input id="memory-search" type="search" placeholder="Search facts" aria-label="Search facts">
+        <label class="muted"><input type="checkbox" id="memory-history"> Show replaced versions</label>
+      </div>
+      <ul id="memory-facts" class="list"></ul>
+    </section>
+
+    <section id="view-toolbox" class="view">
+      <div class="view-head"><h1 class="view-title">Toolbox</h1></div>
+      <h2 class="settings-h">Scheduled work</h2>
+      <p class="muted">Things you asked Jarvis to do later. At the time, Jarvis does them itself (every step is in the Audit Trail);
+        dangerous system actions still wait for your yes.</p>
+      <ul id="tb-jobs-list" class="list"></ul>
+
+      <h2 class="settings-h">Clipboard history</h2>
+      <p class="muted">The last 50 things you copied. Secret-looking copies keep only their length, and copies password managers mark private are never read.
+        Turn off with JARVIS_CLIPBOARD_HISTORY=0.</p>
+      <div class="memory-filter">
+        <input id="tb-clip-search" type="search" placeholder="Search copies" aria-label="Search clipboard history">
+        <button id="tb-clip-clear" class="btn btn-ghost" type="button">Clear all</button>
+        <span id="tb-clip-status" class="muted" aria-live="polite"></span>
+      </div>
+      <ul id="tb-clip-list" class="list"></ul>
+
+      <h2 class="settings-h">Voice macros</h2>
+      <p class="muted">Say a trigger phrase and the steps run straight away, with no AI call. Steps use Jarvis's existing tools;
+        anything dangerous still needs your yes.</p>
+      <ul id="tb-macro-list" class="list"></ul>
+      <form id="tb-macro-form" class="macro-form">
+        <input id="tb-macro-name" placeholder="Name, e.g. work mode" maxlength="60" required aria-label="Macro name">
+        <input id="tb-macro-phrases" placeholder="Trigger phrases, comma separated: start work mode, work time" required aria-label="Trigger phrases">
+        <div id="tb-macro-steps"></div>
+        <div class="macro-form-actions">
+          <button id="tb-macro-add-step" class="btn btn-ghost" type="button">+ Step</button>
+          <button class="btn btn-primary" type="submit">Save macro</button>
+          <span id="tb-macro-status" class="muted" aria-live="polite"></span>
+        </div>
+      </form>
+
+      <h2 class="settings-h">Files</h2>
+      <p class="muted">Files that arrive in watched folders get tags and a fingerprint (for finding duplicates). Nothing is moved.</p>
+      <div class="memory-filter">
+        <input id="tb-files-search" type="search" placeholder="Name contains..." aria-label="Search indexed files">
+        <button id="tb-files-dupes" class="btn btn-ghost" type="button">Show duplicates</button>
+        <button id="tb-files-index" class="btn btn-ghost" type="button">Index what's already there</button>
+        <span id="tb-files-status" class="muted" aria-live="polite"></span>
+      </div>
+      <div id="tb-files-tags" class="chip-row"></div>
+      <ul id="tb-files-list" class="list"></ul>
+
+      <h2 class="settings-h">Background agents</h2>
+      <p class="muted">Standing jobs that run existing tools on a schedule, when certain mail arrives, or when a file lands.
+        Every step is logged in the Audit Trail and dangerous commands still wait for your yes. Paused in safe mode.</p>
+      <ul id="tb-agent-list" class="list"></ul>
+      <form id="tb-agent-form" class="macro-form">
+        <input id="tb-agent-name" placeholder="Name, e.g. landlord mail" maxlength="60" required aria-label="Agent name">
+        <div class="macro-form-actions">
+          <select id="tb-agent-trigger" aria-label="Trigger"><option value="interval">every N minutes</option><option value="daily">daily at a time</option>
+            <option value="mail_match">when matching mail arrives</option><option value="file_event">when a file lands</option><option value="manual">only when I run it</option></select>
+          <input id="tb-agent-max" type="number" min="1" max="288" value="24" aria-label="Max runs per day" title="Max runs per day">
+        </div>
+        <input id="tb-agent-config" class="mono" value='{"every_min": 60}' aria-label="Trigger settings as JSON">
+        <div id="tb-agent-steps"></div>
+        <div class="macro-form-actions">
+          <button id="tb-agent-add-step" class="btn btn-ghost" type="button">+ Step</button>
+          <button class="btn btn-primary" type="submit">Save agent</button>
+          <span id="tb-agent-status" class="muted" aria-live="polite"></span>
+        </div>
+      </form>
+
+      <h2 class="settings-h">Announcement priority</h2>
+      <p class="muted">Kinds of announcement you keep cutting off move to an hourly digest; ones you follow up on keep interrupting. Reminders never wait.</p>
+      <div class="memory-filter"><button id="tb-notify-reset" class="btn btn-ghost" type="button">Reset learning</button>
+        <span id="tb-notify-digest" class="muted" aria-live="polite"></span></div>
+      <ul id="tb-notify-list" class="list"></ul>
+
+      <h2 class="settings-h">Connections</h2>
+      <p class="muted">People, projects, tasks and meetings Jarvis knows about, and how they link.</p>
+      <form id="tb-graph-form" class="memory-filter">
+        <input id="tb-graph-q" type="search" placeholder="A name, e.g. Riley or a project" aria-label="Look up a person or project">
+        <button class="btn btn-primary" type="submit">Look up</button>
+        <button id="tb-graph-sync" class="btn btn-ghost" type="button">Refresh</button>
+      </form>
+      <ul id="tb-graph-out" class="list"></ul>
+
+      <h2 class="settings-h">Suggestions this week</h2>
+      <p class="muted">Worked out from your own usage, with no AI call. Nothing is changed for you.</p>
+      <ul id="tb-report-list" class="list"></ul>
+    </section>
+
+    <section id="view-settings" class="view">
+      <div class="view-head"><h1 class="view-title">Settings</h1></div>
+      <p class="muted">Changes are saved to <span class="mono">.env</span>. Most apply immediately; the rest say "restart".</p>
+      <input id="settings-search" type="search" class="settings-search" placeholder="Search settings..." autocomplete="off" aria-label="Search settings">
+      <h2 class="settings-h">Common</h2>
+      <div id="settings-known" class="settings-list"></div>
+      <h2 class="settings-h">Everything else in .env</h2>
+      <div id="settings-other" class="settings-list"></div>
+      <form id="settings-add-form" class="settings-add">
+        <input id="settings-add-key" placeholder="NEW_SETTING_NAME" autocomplete="off" required aria-label="Setting name">
+        <input id="settings-add-value" placeholder="value" autocomplete="off" aria-label="Setting value">
+        <button class="btn btn-primary" type="submit">Add / update</button>
+        <span id="settings-add-status" class="muted" aria-live="polite"></span>
+      </form>
+    </section>
+  </main>
+
+  <aside id="context" class="context-panel">
+    <div class="context-head">
+      <h2>Detail</h2>
+    </div>
+    <div id="detail-panel" class="detail-panel">
+      <p class="muted">Select a session or task to see details.</p>
+    </div>
+  </aside>
+</div>
+
+<script src="app.js"></script>
+<script src="autonomy.js"></script>
+<script src="qol.js"></script>
+<script src="voice.js"></script>
+<script src="features.js"></script>
+</body>
+</html>

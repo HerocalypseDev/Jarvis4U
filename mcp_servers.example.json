@@ -1,0 +1,57 @@
+{
+  "_comment": "Copy this file to mcp_servers.json (gitignored) and fill in real values. Each top-level key is a server name; its tools are exposed to Jarvis as mcp_<name>_<tool>. Restart jarvis.py (or wait for the next process start — servers connect once, lazily) to pick up changes.",
+  "github": {
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-github"
+    ],
+    "env": {
+      "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_..."
+    }
+  },
+  "slack": {
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-slack"
+    ],
+    "env": {
+      "SLACK_BOT_TOKEN": "xoxb-...",
+      "SLACK_TEAM_ID": "T..."
+    }
+  },
+  "gmail": {
+    "_comment": "One-time setup before this works: enable the Gmail API in Google Cloud Console, create an OAuth client (type: Desktop app), download it as gcp-oauth.keys.json into ~/.gmail-mcp/, then run `npx @gongrzhe/server-gmail-autoauth-mcp auth` once to consent via browser. After that, jarvis.py just needs this entry.",
+    "command": "npx",
+    "args": [
+      "@gongrzhe/server-gmail-autoauth-mcp"
+    ]
+  },
+  "calendar": {
+    "_comment": "Reuses the same gcp-oauth.keys.json as gmail above (same Google Cloud project) -- just also enable the Google Calendar API, then run `npx @cocal/google-calendar-mcp auth` once.",
+    "command": "npx",
+    "args": [
+      "@cocal/google-calendar-mcp"
+    ],
+    "env": {
+      "GOOGLE_OAUTH_CREDENTIALS": "C:\\Users\\YOU\\.gmail-mcp\\gcp-oauth.keys.json"
+    }
+  },
+  "browser": {
+    "_comment": "No credentials needed. Official Microsoft package -- real browser automation (navigate, click, type, fill forms, screenshots, page snapshots).",
+    "command": "npx",
+    "args": [
+      "@playwright/mcp@latest"
+    ]
+  },
+  "whatsapp": {
+    "_comment": "Drives the WhatsApp desktop app (WebView2) through its DevTools port. One-time setup (WhatsApp only, localhost only): reg add HKCU\\Software\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments /v WhatsApp.Root.exe /d \"--remote-debugging-port=9333 --remote-debugging-address=127.0.0.1\" /f, then restart WhatsApp. Never bind 0.0.0.0. Any program running as you can reach this port while WhatsApp is open.",
+    "command": "npx",
+    "args": [
+      "@playwright/mcp@0.0.82",
+      "--cdp-endpoint",
+      "http://127.0.0.1:9333"
+    ]
+  }
+}
