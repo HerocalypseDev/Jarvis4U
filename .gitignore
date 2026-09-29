@@ -32,6 +32,7 @@ pro/
 
 # built Pro pack zips (tools/build_pro_pack.py)
 dist/
+debug_report.txt
 
 # public repo extras
 skills/*.json
