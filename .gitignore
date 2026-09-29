@@ -27,6 +27,9 @@ evals/results/
 # private words the public export must block (tools/export_public.py)
 public_export_denylist.txt
 
+# Jarvis4U Pro pack (bought separately; unzip here, never commit)
+pro/
+
 # public repo extras
 skills/*.json
 public_export_denylist.txt
