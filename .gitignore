@@ -35,6 +35,7 @@ dist/
 debug_report.txt
 doctor_state.json
 evals/drafts.json
+doctor_state.tmp
 
 # public repo extras
 skills/*.json
