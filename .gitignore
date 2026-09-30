@@ -33,6 +33,8 @@ pro/
 # built Pro pack zips (tools/build_pro_pack.py)
 dist/
 debug_report.txt
+doctor_state.json
+evals/drafts.json
 
 # public repo extras
 skills/*.json
