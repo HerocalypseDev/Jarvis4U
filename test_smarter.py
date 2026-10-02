@@ -688,3 +688,83 @@ def test_audit2_a_failed_send_never_backs_an_i_sent_it_claim(jarvis, monkeypatch
     assert "didn't actually send that" in reply
     assert jarvis._looks_failed("MCP tool reported an error: 403") and jarvis._looks_failed("Refused: web links only")
     assert not jarvis._looks_failed("Email sent to sam@example.com (id 42).")
+
+
+# --- step limit + documents (2026-10-02, found live: a Word table job died at "I used 12 steps") --------------
+def test_step_limit_ends_with_an_answer_from_what_was_gathered(jarvis, monkeypatch):
+    monkeypatch.setattr(jarvis, "MAX_AGENT_ITERATIONS", 4)
+    monkeypatch.setattr(jarvis, "_execute_tool_impl", lambda name, inp, *a, **k: f"row {inp.get('n')}: Frieren, 2023")
+    seen = _script(monkeypatch, jarvis, [_call("web_search", {"query": "x", "n": i}, f"t{i}") for i in range(4)]
+                   + [_text("Here are the animes so far: Frieren (2023). I didn't get to the rest.")])
+    reply = jarvis.run_agent_loop("list the animes and release dates")
+    assert reply == "Here are the animes so far: Frieren (2023). I didn't get to the rest."
+    assert len(seen) == 5 and seen[-1]["tool_choice"] == {"type": "none"}
+    assert "used all the tool steps" in str(seen[-1]["messages"][-1]["content"])
+    assert all("tool_choice" not in b for b in seen[:4])
+    from jarvis_gemini import to_request
+    assert to_request(seen[-1], "gemini-3.1-flash-lite")["toolConfig"] == {"functionCallingConfig": {"mode": "NONE"}}
+    assert "toolConfig" not in to_request(seen[0], "gemini-3.1-flash-lite")
+
+
+def test_read_file_reads_word_tables_and_slides(jarvis, tmp_path):
+    import zipfile
+    import docx
+
+    d = docx.Document()
+    d.add_paragraph("My anime list")
+    t = d.add_table(rows=3, cols=2)
+    for r, (a, b) in enumerate([("Anime", "Release"), ("Frieren", "2023"), ("Dandadan", "2024")]):
+        t.cell(r, 0).text, t.cell(r, 1).text = a, b
+    d.add_paragraph("End of list")
+    d.save(tmp_path / "anime.docx")
+    out = jarvis._read_file_tool(str(tmp_path / "anime.docx"))
+    assert out.splitlines()[:5] == ["My anime list", "[table 1]", "| Anime | Release |", "| Frieren | 2023 |",
+                                    "| Dandadan | 2024 |"] and "End of list" in out
+    a = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    with zipfile.ZipFile(tmp_path / "deck.pptx", "w") as z:
+        for n, text in ((2, "Second"), (1, "First"), (10, "Tenth")):
+            z.writestr(f"ppt/slides/slide{n}.xml", f'<p:sld xmlns:p="x" xmlns:a="{a}"><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:sld>')
+    assert jarvis._read_file_tool(str(tmp_path / "deck.pptx")).split() == [
+        "[slide", "1]", "First", "[slide", "2]", "Second", "[slide", "3]", "Tenth"]
+    (tmp_path / "broken.docx").write_text("not a zip")
+    assert jarvis._read_file_tool(str(tmp_path / "broken.docx")).startswith("Failed to read broken.docx")
+    (tmp_path / "plain.txt").write_text("hello")
+    assert jarvis._read_file_tool(str(tmp_path / "plain.txt")) == "hello"
+
+
+def test_scheduled_mail_check_never_reports_the_same_email_twice(jarvis, monkeypatch):
+    """Found live 2026-10-02: hourly gmail_watch searched is:unread and re-announced the same unread mail every hour."""
+    inbox = {"text": ("ID: a1\nSubject: New sign-in detected on your Vercel account\nFrom: Vercel <n@vercel.com>\n\n"
+                      "ID: a2\nSubject: Spotify offer\nFrom: Spotify <n@spotify.com>")}
+    monkeypatch.setattr(jarvis, "execute_mcp_tool", lambda name, inp: inbox["text"])
+    monkeypatch.setitem(jarvis._mcp_tool_index, "mcp_gmail_search_emails", ("gmail", "search_emails"))
+    monkeypatch.setattr(jarvis, "record_recent_task", lambda *a, **k: None)
+    spoken = []
+    monkeypatch.setattr(jarvis, "queue_or_deliver_notification", lambda text, **k: spoken.append(text))
+    skill = {"name": "gmail_watch", "instructions": "check mail"}
+    seen = _script(monkeypatch, jarvis, [_call("mcp_gmail_search_emails", {"query": "is:unread"}),
+                                         _text("New sign-in on your Vercel account.")])
+    jarvis._run_scheduled_skill(skill)
+    assert spoken == ["New sign-in on your Vercel account."] and "a1" in str(seen[1]["messages"][-1]["content"])
+    # next hour: same two unread messages plus one new one -> only the new one reaches the model
+    inbox["text"] += "\n\nID: a3\nSubject: Your mum: call me\nFrom: Mum <mum@example.com>"
+    seen = _script(monkeypatch, jarvis, [_call("mcp_gmail_search_emails", {"query": "is:unread"}), _text("")])
+    jarvis._run_scheduled_skill(skill)
+    result = str(seen[1]["messages"][-1]["content"])
+    assert "a3" in result and "a1" not in result and "Vercel" not in result and "2 message(s) left out" in result
+    # nothing new at all -> told so plainly; a user's own "check my email" is never filtered
+    seen = _script(monkeypatch, jarvis, [_call("mcp_gmail_search_emails", {"query": "is:unread"}), _text("")])
+    jarvis._run_scheduled_skill(skill)
+    assert "No new email since the last check" in str(seen[1]["messages"][-1]["content"])
+    assert jarvis._hide_mail_already_checked("mcp_gmail_search_emails", inbox["text"]) == inbox["text"]
+
+
+def test_a_failed_scheduled_run_does_not_mark_mail_as_checked(jarvis, monkeypatch):
+    monkeypatch.setattr(jarvis, "execute_mcp_tool", lambda name, inp: "ID: b1\nSubject: Deadline tomorrow\nFrom: x")
+    monkeypatch.setitem(jarvis._mcp_tool_index, "mcp_gmail_search_emails", ("gmail", "search_emails"))
+    monkeypatch.setattr(jarvis, "record_recent_task", lambda *a, **k: None)
+    monkeypatch.setattr(jarvis, "queue_or_deliver_notification", lambda *a, **k: None)
+    replies = iter([_call("mcp_gmail_search_emails", {"query": "is:unread"}), None])
+    monkeypatch.setattr(jarvis, "_claude_request", lambda body, timeout: next(replies))
+    jarvis._run_scheduled_skill({"name": "gmail_watch", "instructions": "check mail"})
+    assert jarvis._skill_mail_seen_ids("gmail_watch") == set()

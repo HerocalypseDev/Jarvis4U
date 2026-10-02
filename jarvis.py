@@ -119,6 +119,7 @@ import jarvis_memory_search as memory_search
 import jarvis_kg as kg
 import jarvis_notify_priority as notify_priority
 import jarvis_improvement_report as improvement_report
+import jarvis_docread
 import jarvis_untrusted
 import jarvis_deferred as deferred
 import jarvis_cascades as cascades
@@ -249,17 +250,38 @@ _playback_lock = threading.Lock()
 _speech_interrupted_at = [0.0]
 
 
+# The OutputStream of the sentence being streamed right now (set by _play_pcm_stream), so a barge-in can
+# abort it at once. sd.stop() only ends sd.play() playback; a streamed sentence used to keep playing until
+# its NEXT network chunk arrived, so "talking over Jarvis" left his voice running (and jarvis_speaking set,
+# which blocks listening) for as long as the network was slow.
+_active_out: list = [None]
+_BARGE_IN_REPEAT_S = 1.0
+
+
 def _interrupt_speech() -> None:
-    _speech_interrupted_at[0] = time.monotonic()
-    try:
-        notify_priority.on_interrupt(_memory_db_connect, _memory_db_lock)  # C6: cut off = dismissed
-    except Exception as e:
-        log.debug("notification stats failed: %s", e)
+    now = time.monotonic()
+    # The mic loop calls this on EVERY audio block while the key is held and Jarvis is still speaking
+    # (~30 ms apart): the DB write and the log line must happen once per press, not dozens of times,
+    # or the loop and the playback thread fight over the memory-DB lock (heard as a glitching voice).
+    first = now - _speech_interrupted_at[0] > _BARGE_IN_REPEAT_S
+    _speech_interrupted_at[0] = now
+    if first:
+        try:
+            notify_priority.on_interrupt(_memory_db_connect, _memory_db_lock)  # C6: cut off = dismissed
+        except Exception as e:
+            log.debug("notification stats failed: %s", e)
     try:
         sd.stop()  # ends a blocking sd.play()/sd.wait() immediately
     except Exception as e:
         log.debug("sd.stop failed: %s", e)
-    log.info("Barge-in: speech interrupted.")
+    out = _active_out[0]
+    if out is not None:
+        try:
+            out.abort()  # a streamed sentence: stop the device now, not at the next chunk
+        except Exception as e:
+            log.debug("stream abort failed: %s", e)
+    if first:
+        log.info("Barge-in: speech interrupted.")
 
 
 def _speech_cancelled_since(t0: float) -> bool:
@@ -412,19 +434,50 @@ def _is_confirmation_yes(transcript: str) -> bool:
     return bool(_CONFIRM_YES_RE.search(t))
 
 
-# A connected MCP server named "homework" (a class homework app): these two can't be undone, so they go
-# through the same staged confirmation as a catastrophic command (spoken yes / dashboard Approve).
-_HOMEWORK_CONFIRM = {"mcp_homework_delete_homework", "mcp_homework_set_student_password"}
+# --- Confirmation add-ons ---------------------------------------------------------------------------------------
+# A file named `*_gate.py` next to jarvis.py can put a connected MCP server's irreversible tools behind the same staged
+# confirmation as a catastrophic command (spoken yes / dashboard Approve, same skip_confirmation re-run). It is matched
+# on the server's REAL tool name, so it holds whatever the server is called in mcp_servers.json. A gate module has
+#   CONFIRM: set of real tool names, confirm_reason(real, inp) -> str | None,
+# and optionally, to let several calls of one tool wait for a single yes:
+#   BATCH_MAX: {real name: max calls}, batch_key(real, inp) (dedupe), label(real, inp), batch_reason(real, labels),
+#   staged_message(real, labels), duplicate_message(real, label, labels), full_message(real, n, max),
+#   summary(real, n, [(label, why), ...]).
+# With no gate files (the default) nothing changes.
+def _load_confirm_gates() -> list:
+    import importlib.util
+    gates = []
+    for path in sorted(Path(__file__).resolve().parent.glob("*_gate.py")):
+        try:
+            spec = importlib.util.spec_from_file_location(path.stem, path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            if getattr(mod, "CONFIRM", None) and callable(getattr(mod, "confirm_reason", None)):
+                gates.append(mod)
+        except Exception as e:
+            log.warning("Confirmation add-on %s not loaded: %s", path.name, e)
+    return gates
 
 
-def _homework_confirm_reason(tool_name: str, inp: dict) -> str | None:
-    if tool_name not in _HOMEWORK_CONFIRM:
-        return None
-    if tool_name.endswith("delete_homework"):
-        title = str(inp.get("confirm_title") or inp.get("homework_id") or "that homework")[:80]
-        return f'permanently delete the homework "{title}" with every answer, file record and grade'
-    who = str(inp.get("student") or "a student")[:40]
-    return f"change {who}'s homework-app password and sign them out everywhere"
+_CONFIRM_GATES = _load_confirm_gates()
+
+
+def _gate_for(tool_name: str):
+    """(gate module, the server's real tool name) when an add-on guards this MCP tool, else (None, None)."""
+    if not tool_name.startswith("mcp_") or not _CONFIRM_GATES:
+        return None, None
+    real = (globals().get("_mcp_tool_index", {}).get(tool_name) or (None, None))[1]
+    for gate in _CONFIRM_GATES:
+        name = real if real is not None else next(  # not connected yet: fall back to the name Jarvis exposes
+            (n for n in gate.CONFIRM if tool_name.lower().endswith("_" + n)), None)
+        if name in gate.CONFIRM:
+            return gate, name
+    return None, None
+
+
+def _addon_confirm_reason(tool_name: str, inp: dict) -> str | None:
+    gate, real = _gate_for(tool_name)
+    return gate.confirm_reason(real, inp) if gate else None
 
 
 def _queue_pending_confirmation(tool_name: str, tool_input: dict, reason: str) -> bool:
@@ -441,6 +494,47 @@ def _queue_pending_confirmation(tool_name: str, tool_input: dict, reason: str) -
         }
     dashboard.notify({"type": "pending_action", "data": dict(_pending_action)})
     return True
+
+
+# Several calls of a tool an add-on marks as batchable (BATCH_MAX) can wait for one yes: "delete these 3" makes 3 calls
+# in one turn, but there is only one pending slot, so calls 2 and 3 used to be dropped. Further calls join the pending
+# one (extra inputs in "batch"). Every other tool still gets "Another confirmation is already pending".
+def _pending_calls(step: dict) -> list[dict]:
+    """Every tool input a staged action will run, in order: the main one, then any batched ones."""
+    return [step.get("tool_input") or {}] + list(step.get("batch") or [])
+
+
+def _batch_pending_call(tool_name: str, tool_input: dict) -> str | None:
+    """Adds a call to a pending call of the same batchable tool. Returns the message for the model, or None when this
+    call can't join (not batchable, nothing pending, a different tool, a stale one, or one staged from another source)."""
+    global _pending_action
+    gate, real = _gate_for(tool_name)
+    limit = (getattr(gate, "BATCH_MAX", None) or {}).get(real) if gate else None
+    if not limit:
+        return None
+    with _pending_action_lock:
+        p = _pending_action
+        now = time.monotonic()
+        if (p is None or p.get("tool_name") != tool_name
+                or now - float(p.get("queued_at", now)) > PENDING_ACTION_TTL_S
+                or p.get("source") != (_current_command_source() or "unattended")):
+            return None
+        calls = _pending_calls(p)
+        if any(gate.batch_key(real, c) == gate.batch_key(real, tool_input) for c in calls):
+            return gate.duplicate_message(real, gate.label(real, tool_input), [gate.label(real, c) for c in calls])
+        if len(calls) >= limit:
+            return gate.full_message(real, len(calls), limit)
+        calls.append(dict(tool_input))
+        labels = [gate.label(real, c) for c in calls]
+        _pending_action = {
+            **p, "batch": [dict(c) for c in calls[1:]], "reason": gate.batch_reason(real, labels),
+            # What would run changed, so an Approve of the version reviewed before must not run this one
+            # (_pending_matches compares queued_at), and the TTL starts again.
+            "queued_at": max(now, float(p.get("queued_at", 0)) + 1e-3),
+        }
+        snapshot = dict(_pending_action)
+    dashboard.notify({"type": "pending_action", "data": snapshot})
+    return gate.staged_message(real, labels)
 
 
 def _pending_matches(step: dict | None, expect) -> bool:
@@ -466,14 +560,35 @@ def _execute_confirmed_action(step: dict, reply_sink=None) -> None:
     tool_name = str(step.get("tool_name") or "")
     tool_input = step.get("tool_input") or {}
     log.info("Confirmed by user: executing staged %s(%r)", tool_name, tool_input)
-    result = _execute_tool(tool_name, tool_input, transcript="", skip_confirmation=True)
-    reply = result or "Done."
+    if step.get("batch"):
+        reply = _run_confirmed_batch(tool_name, _pending_calls(step))
+    else:
+        result = _execute_tool(tool_name, tool_input, transcript="", skip_confirmation=True)
+        reply = result or "Done."
     # A phone-originated command already got its "Message received." ack up front, in
     # handle_text_command — the full result goes back to the phone only, not spoken locally.
     if reply_sink:
         reply_sink(reply)
     else:
         _speak_shaped(reply)
+
+
+def _run_confirmed_batch(tool_name: str, calls: list[dict]) -> str:
+    """Runs each confirmed call in order through the normal confirmed path; one failure never stops the rest.
+    Returns one short summary written by the tool's add-on (see _batch_pending_call)."""
+    gate, real = _gate_for(tool_name)
+    failures = []
+    for inp in calls:
+        try:
+            result = _execute_tool(tool_name, inp, transcript="", skip_confirmation=True)
+        except Exception as e:
+            result = f"Tool failed: {e}"
+        if _looks_failed(result):
+            failures.append((gate.label(real, inp) if gate else "one call", str(result or "no answer")))
+    if gate:
+        return gate.summary(real, len(calls), failures)
+    return f"Ran {len(calls) - len(failures)} of {len(calls)}." + (
+        " Failed: " + "; ".join(w[:80] for _, w in failures) if failures else "")
 
 
 def _dashboard_get_pending() -> dict | None:
@@ -975,6 +1090,7 @@ def _play_pcm_stream(chunks, sample_rate: int, on_first_chunk=None) -> bool:
             # or a dropout — this is the reported "voice breaks a lot" symptom (2026-09-22
             # voice-bug pass). This trades a little more time-to-first-audio for not glitching.
             with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32", latency="high") as out:
+                _active_out[0] = out
                 for chunk in chunks:
                     if _speech_cancelled_since(t0):
                         out.abort()  # barge-in: drop what's buffered too
@@ -999,11 +1115,15 @@ def _play_pcm_stream(chunks, sample_rate: int, on_first_chunk=None) -> bool:
                     # silently dropping it.
                     _write(out, bytes(prebuffer))
         except Exception as e:
-            log.warning(
-                "Deepgram streaming TTS playback failed%s: %s",
-                "" if any_played else " before any audio played", e,
-            )
+            if _speech_cancelled_since(t0):
+                log.debug("streamed playback aborted by barge-in: %s", e)  # expected: the abort ends write()
+            else:
+                log.warning(
+                    "Deepgram streaming TTS playback failed%s: %s",
+                    "" if any_played else " before any audio played", e,
+                )
         finally:
+            _active_out[0] = None
             jarvis_speaking.clear()
             audio_duck.release()
     return any_played
@@ -1384,7 +1504,12 @@ MAX_TOOL_CALLS_PER_TURN = 5  # cap on parallel tool calls Claude can request in 
 # simple command still stops as soon as Claude replies without a tool_use. Was 6, which a
 # compound multi-step instruction (search email, build a file, send it, confirm) could
 # exhaust and get cut off mid-task even with nothing going wrong.
-MAX_AGENT_ITERATIONS = 12
+MAX_AGENT_ITERATIONS = max(4, min(40, env_int("JARVIS_MAX_AGENT_STEPS", 12)))
+# When the steps run out mid-task, one last round with tools switched off asks for an answer from what was
+# gathered (found live 2026-10-02: Gemini got 12 steps into a job and the user only heard "I used 12 steps").
+STEPS_USED_UP_NOTE = ("[system] You have used all the tool steps for this request. Do not call any more tools. Answer the "
+                      "user now from what the tool results above already show; if part of the job is not done, say plainly "
+                      "which part, so they can ask for the rest.")
 # Output cap per agent-loop round. A whole document is written as one write_file call, so the old
 # 1536 cut such calls off mid-way (stop_reason max_tokens) and the command ended with no reply and
 # no file. Only generated tokens are billed, so a high cap costs nothing on short replies.
@@ -1902,7 +2027,7 @@ AGENT_TOOLS = [
     },
     {
         "name": "read_file",
-        "description": "Read a text file and return its contents (truncated if very large). A relative path or bare filename is looked up in Jarvis_Workspace and its subfolders; absolute paths work anywhere.",
+        "description": "Read a file and return its contents (truncated if very large). Text files, and Word (.docx), PDF and PowerPoint (.pptx) files: their text and tables (as | cell | cell | rows) in one call, so never open those another way. A relative path or bare filename is looked up in Jarvis_Workspace and its subfolders; absolute paths work anywhere.",
         "input_schema": {
             "type": "object",
             "properties": {"path": {"type": "string"}},
@@ -4905,14 +5030,52 @@ def list_reminders(include_delivered: bool = False) -> str:
             rows = conn.execute(sql).fetchall()
         finally:
             conn.close()
-    if not rows:
-        return "No upcoming reminders."
     lines = []
     for rid, text, due_at, repeat, delivered_at in rows:
         tag = " [delivered]" if delivered_at else ""
         repeat_note = f", repeating every {repeat:.0f} min" if repeat else ""
         lines.append(f"#{rid} at {due_at}{repeat_note}: {text}{tag}")
-    return "\n".join(lines)
+    out = "\n".join(lines) if lines else "No upcoming reminders."
+    return out + _tracked_deadlines_note()
+
+
+def _briefing_deadline_commitments(now: datetime | None = None, horizon_h: float = 24) -> list[dict]:
+    """The open autonomy commitments the briefing / "what's urgent" list as deadlines ("overdue: X"): due within
+    horizon_h or already past, not quarantined, and not already shown by a reminder/calendar event/Jarvis job."""
+    if not autonomy.enabled():
+        return []
+    now = now or datetime.now()
+    out = []
+    for c in autonomy.status()["commitments"]:
+        if c.get("quarantined") or _commitment_handled_elsewhere(c):
+            continue
+        due = briefing._when(c.get("deadline_iso") or "")
+        if due is not None and due <= now + timedelta(hours=horizon_h):
+            out.append(c)
+    return out
+
+
+def _tracked_deadlines_note() -> str:
+    """Found live (2026-10-02): "remove all overdue reminders about my exam" listed reminders, found none, and
+    Jarvis said it had cleared them, while the briefing kept saying "overdue: entrance exam results come out".
+    Those lines are autonomy commitments, not reminders, so list_reminders now shows them with how to close them."""
+    try:
+        rows = _briefing_deadline_commitments()
+    except Exception as e:
+        log.debug("tracked deadlines for list_reminders failed: %s", e)
+        return ""
+    if not rows:
+        return ""
+    now = datetime.now()
+    lines = []
+    for c in rows[:15]:
+        due = briefing._when(c.get("deadline_iso") or "")
+        when = "overdue" if due and due < now else f"due {c.get('deadline_iso')}"
+        lines.append(f"commitment #{c['id']} ({when}): {(c.get('description') or c.get('title') or '')[:100]}")
+    return ("\n\nAlso tracked deadlines (these are what the briefing and \"what's urgent\" call overdue/due; they are "
+            "autonomy commitments, NOT reminders, so cancel_reminder can't clear them. To clear one, call the autonomy "
+            "tool with action cancel_commitment (no longer needed) or complete_commitment (done) and its id):\n"
+            + "\n".join(lines))
 
 
 def _commitment_handled_elsewhere(c: dict) -> bool:
@@ -5326,6 +5489,77 @@ def _skill_is_due(skill: dict, now: datetime) -> bool:
 _BARE_ACK_RE = re.compile(r"^\W*(ok(ay)?|done|noted|nothing( new| important)?( here)?|all (good|clear)|no (reply|response) needed)\W*$", re.I)
 
 
+# Found live (2026-10-02): the hourly gmail_watch skill searches "is:unread", so every run got the same unread
+# mail back and re-announced it ("New sign-in detected on your Vercel account" hour after hour). A scheduled skill
+# now only sees mail its earlier runs haven't already seen: the ids shown in a run are remembered per skill once
+# the run finishes (a failed run remembers nothing, so nothing is lost), and later runs get them filtered out.
+SKILL_MAIL_SEEN_DAYS = 30
+_MAIL_LIST_TOOLS = {"search_emails", "list_emails", "list_messages", "search_messages"}
+_MAIL_ID_RE = re.compile(r"^\s*ID:\s*(\S+)", re.M | re.I)
+
+
+def _skill_mail_db():
+    conn = _memory_db_connect()
+    conn.execute("CREATE TABLE IF NOT EXISTS skill_seen_mail (skill TEXT NOT NULL, msg_id TEXT NOT NULL, "
+                 "seen_at TEXT NOT NULL, PRIMARY KEY (skill, msg_id))")
+    return conn
+
+
+def _skill_mail_seen_ids(skill: str) -> set[str]:
+    with _memory_db_lock:
+        conn = _skill_mail_db()
+        try:
+            return {r[0] for r in conn.execute("SELECT msg_id FROM skill_seen_mail WHERE skill = ?", (skill,))}
+        finally:
+            conn.close()
+
+
+def _remember_skill_mail(skill: str, ids: set[str]) -> None:
+    if not ids:
+        return
+    now = datetime.now()
+    with _memory_db_lock:
+        conn = _skill_mail_db()
+        try:
+            conn.executemany("INSERT OR IGNORE INTO skill_seen_mail (skill, msg_id, seen_at) VALUES (?, ?, ?)",
+                             [(skill, i, now.isoformat(timespec="seconds")) for i in ids])
+            conn.execute("DELETE FROM skill_seen_mail WHERE seen_at < ?",
+                         ((now - timedelta(days=SKILL_MAIL_SEEN_DAYS)).isoformat(timespec="seconds"),))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _hide_mail_already_checked(tool_name: str, result: str) -> str:
+    """During a scheduled skill run: drop messages an earlier run of the same skill already saw from a mail
+    search/list result (blocks of ID:/Subject:/From:/Date: lines), and note the ids this run saw."""
+    skill = getattr(_command_ctx, "scheduled_skill", None)
+    real = (_mcp_tool_index.get(tool_name) or (None, "_".join(tool_name.split("_")[-2:])))[1]
+    if not skill or real not in _MAIL_LIST_TOOLS or not isinstance(result, str) or _looks_failed(result):
+        return result
+    try:
+        seen = _skill_mail_seen_ids(skill)
+    except Exception as e:
+        log.debug("seen-mail lookup failed: %s", e)
+        return result
+    kept, dropped = [], 0
+    shown = getattr(_command_ctx, "mail_shown", None)
+    for block in re.split(r"\n\s*\n", result):
+        m = _MAIL_ID_RE.search(block)
+        if m and m.group(1) in seen:
+            dropped += 1
+            continue
+        if m and shown is not None:
+            shown.add(m.group(1))
+        kept.append(block)
+    if not dropped:
+        return result
+    note = (f"({dropped} message(s) left out: an earlier run of this check already saw them, so do not mention "
+            "them again.)")
+    body = "\n\n".join(b for b in kept if b.strip())
+    return (body + "\n\n" + note) if _MAIL_ID_RE.search(body) else "No new email since the last check. " + note
+
+
 def _run_scheduled_skill(skill: dict) -> None:
     log.info("Running scheduled skill %r.", skill["name"])
     # Session context: mark a scheduled task as in-flight so anything checking
@@ -5337,6 +5571,7 @@ def _run_scheduled_skill(skill: dict) -> None:
         f"(This is a scheduled, proactive run of your \"{skill['name']}\" skill — the user "
         f"didn't just ask for this out loud, act on the schedule instead.) {skill['instructions']}"
     )
+    _command_ctx.scheduled_skill, _command_ctx.mail_shown = skill["name"], set()
     try:
         # An unprompted run must stay quiet when the model gives no text: never fall back to the
         # last tool's result (e.g. a remember_fact ack), and treat a bare "OK"/"Done." as silence.
@@ -5345,9 +5580,12 @@ def _run_scheduled_skill(skill: dict) -> None:
             # Route through the interrupt gate instead of speaking immediately — a scheduled
             # skill is exactly the kind of unprompted interrupt session context exists for.
             queue_or_deliver_notification(reply)
+        if reply != _llm_unavailable_reply():  # the brain answered: what it saw counts as checked
+            _remember_skill_mail(skill["name"], _command_ctx.mail_shown)
     except Exception as e:
         log.warning("Scheduled skill %r failed: %s", skill["name"], e)
     finally:
+        _command_ctx.scheduled_skill, _command_ctx.mail_shown = None, None
         _set_scheduled_task_running(False)
         _set_last_skill_run(skill["name"], datetime.now())
 
@@ -7223,13 +7461,9 @@ def _briefing_fetchers(kind: str, now: datetime) -> dict:
         return briefing.mail_items([m for m in sleep_mail.parse_search(found) if m.get("sender") not in own])
 
     def deadlines():
-        if not autonomy.enabled():
-            return []
         # A commitment a reminder / calendar event / Jarvis job already handles is shown by that thing while
         # it is live; listing it here too kept "overdue: X" up after the reminder fired or was cleared.
-        rows = [c for c in autonomy.status()["commitments"] if not c.get("quarantined")
-                and not _commitment_handled_elsewhere(c)]
-        return briefing.deadline_items(rows, now, 24)
+        return briefing.deadline_items(_briefing_deadline_commitments(now, 24), now, 24)
 
     def needs_you():
         if not autonomy.enabled():
@@ -9442,7 +9676,12 @@ def _read_file_tool(path: str) -> str:
     if bad:
         return f"Refused to read {path}: {bad}."
     try:
-        data = jarvis_workspace.resolve_read_path(path).read_text(encoding="utf-8", errors="replace")
+        target = jarvis_workspace.resolve_read_path(path)
+        # Word/PDF/PowerPoint are zip/binary files: read as text they came back as gibberish, and the model burned
+        # every agent step trying other ways to open them (found live 2026-10-02 with a table in a .docx).
+        data = jarvis_docread.read_document(target)
+        if data is None:
+            data = target.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         return f"Failed to read {path}: {e}"
     if len(data) > MAX_TOOL_RESULT_CHARS * 2:
@@ -10240,7 +10479,7 @@ def _set_plan(transcript: str, steps: list) -> str:
 
 
 def _redact_audit_input(tool_input):
-    """The audit trail never stores a password value (e.g. set_student_password)."""
+    """The audit trail never stores a password value."""
     if not isinstance(tool_input, dict):
         return tool_input
     return {k: ("[hidden]" if "password" in str(k).lower() and v else v) for k, v in tool_input.items()}
@@ -10335,6 +10574,12 @@ _ACTION_CLAIMS = [
                 r"[^.!?]{0,110}\b(?:form|fields?|box(?:es)?|space|answer boxes|browser|page|screen|text ?box|application|answers?)\b"
                 r"|\b(?:form|fields?|answers?) (?:has been |have been |was |were |is |are )?(?:filled|typed|written|entered)\b", re.I),
      re.compile(r"type|fill|multiedit|paste|write_file", re.I)),  # write_file: "I've written the answer down in a note"
+    ("clear those",  # found live 2026-10-02: "I've cleared those old reminders" after only list_reminders ran
+     re.compile(r"\b(?:i'?ve|i have|i just|i)\s+(?:cleared|removed|deleted|cancelled|canceled|dismissed|closed|wiped)\b"
+                r"[^.!?]{0,40}\b(?:reminders?|deadlines?|overdue|commitments?|items?|tasks?|alerts?)\b"
+                r"|\b(?:reminders?|deadlines?|commitments?|overdue items?)\b (?:have been |has been |were |was |are |is )?"
+                r"(?:cleared|removed|deleted|cancelled|canceled|closed)\b", re.I),
+     re.compile(r"cancel|complete|delete|remove|clear|autonomy|forget|dismiss", re.I)),
     ("remember that",
      re.compile(r"\bi'?ll remember\b|\b(?:i'?ve|i have)\s+(?:noted|remembered|saved)\b[^.!?]{0,20}\b(?:that|it|this)\b"
                 r"[^.!?]{0,20}\b(?:memory|remember)?", re.I),
@@ -10510,6 +10755,22 @@ def _ui_script_problem(code: str) -> str | None:
     return _UI_SCRIPT_REFUSAL if _UI_SCRIPT_RE.search(code or "") else None
 
 
+# The file tools refuse credential files (jarvis_workspace.sensitive_reason), but a shell/python one-liner that
+# opens .env prints every key into the model's context (debug report 2026-10-01: "open('.env').read()" while
+# hunting for an app's web address). Refuse code that names the file; reading one variable via os.environ is still fine.
+_SECRET_FILE_RE = re.compile(
+    r"(?<![\w.])\.env(?![\w]|\.example\b|\.sample\b)|\bmcp_servers\.json\b|\bjarvis_memory\.db\b|\bface\.key\b",
+    re.IGNORECASE)
+_SECRET_FILE_REFUSAL = (
+    "Refused: that code opens a file that holds credentials (.env, mcp_servers.json, ...). Its contents would be "
+    "read into the conversation. To check one setting use os.environ.get('NAME') (print only whether it is set), "
+    "and ask the user to edit the file themselves.")
+
+
+def _secret_file_problem(code: str) -> str | None:
+    return _SECRET_FILE_REFUSAL if _SECRET_FILE_RE.search(code or "") else None
+
+
 # A recursive name search through the shell (Get-ChildItem -Recurse -Filter/-Include, dir /s, where /r) is what the
 # model falls back on for "find my file". When Everything is reachable that is slow and pointless, so it is
 # refused and pointed at quick_search. With Everything unreachable it is allowed (it's the documented fallback).
@@ -10605,7 +10866,7 @@ def _execute_tool_impl(
             # browser), so their text goes through the same tripwire as run_shell/run_python.
             reason = None if skip_confirmation else (_catastrophic_reason(
                 " ".join(str(v) for v in inp.values() if isinstance(v, (str, int, float)))
-            ) or _homework_confirm_reason(tool_name, inp))
+            ) or _addon_confirm_reason(tool_name, inp))
             if reason:
                 if _queue_pending_confirmation(tool_name, dict(inp), reason):
                     result = (
@@ -10613,7 +10874,9 @@ def _execute_tool_impl(
                         'Say "yes" on your next turn to actually run it.'
                     )
                 else:
-                    result = "Another confirmation is already pending; ignoring this one."
+                    # A batchable add-on tool may join a pending call of the same tool; anything else is refused.
+                    result = (_batch_pending_call(tool_name, dict(inp))
+                              or "Another confirmation is already pending; ignoring this one.")
             elif tool_name.startswith("mcp_whatsapp_") and tool_name.endswith("_navigate"):
                 result = ("Don't navigate the WhatsApp app anywhere: it is the desktop app, already "
                           "on WhatsApp. Use browser_snapshot, then click/type instead.")
@@ -10628,6 +10891,7 @@ def _execute_tool_impl(
                 problem = (_ensure_whatsapp_desktop()
                            if tool_name.startswith("mcp_whatsapp_") else None)
                 result = problem or execute_mcp_tool(tool_name, inp)
+                result = _hide_mail_already_checked(tool_name, result)
         elif tool_name in ("open_url", "play_media") and _is_whatsapp_web_url(inp.get("url")):
             result = _ensure_whatsapp_desktop() or (
                 "Opened the WhatsApp desktop app instead of WhatsApp Web. "
@@ -10868,6 +11132,8 @@ def _execute_tool_impl(
                 result = "No command given."
             elif _ui_script_problem(command):
                 result = _ui_script_problem(command)
+            elif _secret_file_problem(command):
+                result = _secret_file_problem(command)
             elif _file_search_via_shell_problem(command):
                 result = _file_search_via_shell_problem(command)
             else:
@@ -10890,6 +11156,8 @@ def _execute_tool_impl(
                 result = "No code given (run_python takes the Python source in 'code')."
             elif _ui_script_problem(code):
                 result = _ui_script_problem(code)
+            elif _secret_file_problem(code):
+                result = _secret_file_problem(code)
             else:
                 reason = None if skip_confirmation else _catastrophic_reason(code)
                 if reason:
@@ -11461,6 +11729,25 @@ def _claude_stream_first_round(body: dict, timeout: int, speak_live, on_first_to
 
 
 _RAW_TOOL_OUTPUT_RE = re.compile(r"^\s*(?:exit_code=|stdout:|stderr:|\[?\s*\"?\s*Cursor Position|Cursor Position|###\s|\{|\[)")
+
+
+def _steps_used_up_reply(model: str, system_blocks, messages: list, cached_tools, smart: bool) -> str:
+    """The answer after the step limit: the last user message (the tool results) gets STEPS_USED_UP_NOTE, and the
+    request goes out with tool_choice none so the model has to reply in words. '' when that fails too."""
+    last = messages[-1] if messages else None
+    if not (last and last.get("role") == "user" and isinstance(last.get("content"), list)):
+        return ""
+    last["content"] = list(last["content"]) + [{"type": "text", "text": STEPS_USED_UP_NOTE}]
+    body = {"model": model, "max_tokens": AGENT_MAX_TOKENS, "system": system_blocks,
+            "messages": _messages_with_cache_breakpoint(messages), "tools": cached_tools, "tool_choice": {"type": "none"}}
+    if smart:
+        body.update(thinking={"type": "adaptive"}, output_config={"effort": SMART_MODEL_EFFORT})
+    data = _claude_request(body, timeout=AGENT_ROUND_TIMEOUT_S)
+    if not data:
+        return ""
+    messages.append({"role": "assistant", "content": data.get("content", [])})
+    return " ".join(b.get("text", "").strip() for b in data.get("content", [])
+                    if b.get("type") == "text" and b.get("text")).strip()
 
 
 def _no_reply_fallback(last_result: str, used_tool_names: list[str]) -> str:
@@ -12048,6 +12335,12 @@ def run_agent_loop(transcript: str, tone: dict | None = None, narrate: bool = Fa
             # Switched without thinking: earlier assistant turns have no thinking blocks to echo back.
             model, escalated = esc_model, True
             log.info("A tool failed; escalating the rest of this command to %s", model)
+    else:
+        # Every step went on tool calls and the model never answered: one final round with tools off.
+        log.warning("Agent loop used all %d steps; asking for an answer from what was gathered.", MAX_AGENT_ITERATIONS)
+        wrap = _steps_used_up_reply(model, system_blocks, messages, cached_tools, smart)
+        if wrap:
+            reply_parts.append(wrap)
 
     reply = " ".join(p.strip() for p in reply_parts if p.strip())
     if (
