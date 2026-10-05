@@ -41,6 +41,11 @@ doctor_state.tmp
 update_note.json
 update_note.tmp
 
+# deleted skills are moved here, not erased (audit 2026-10-04)
+skills/.deleted/
+llm_provider.json.tmp
+skills/*.json.tmp
+
 # public repo extras
 skills/*.json
 public_export_denylist.txt

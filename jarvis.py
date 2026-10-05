@@ -376,6 +376,25 @@ _CATASTROPHIC_PATTERNS = _CATASTROPHIC_PATTERNS + (
         ),
         "delete a Windows service or user account, add an administrator, or take over permissions on system folders",
     ),
+    # Audit 2026-10-04: deleting the backups (shadow copies, Windows backup catalog) can't be undone either, and
+    # force-killing a critical system process blue-screens / reboots the PC at once.
+    (
+        re.compile(
+            r"\bvssadmin\b[^\n]*\b(?:delete|resize)\b|\bwmic\b[^\n]*\bshadowcopy\b[^\n]*\bdelete\b|"
+            r"\bwbadmin\b[^\n]*\bdelete\b|remove-wmiobject\b[^\n]*win32_shadowcopy|"
+            r"get-(?:wmiobject|ciminstance)\b[^\n]*win32_shadowcopy[^\n]*\|\s*remove-",
+            re.I,
+        ),
+        "delete the system's backups (shadow copies or the Windows backup catalog)",
+    ),
+    (
+        re.compile(
+            r"\b(?:taskkill|stop-process|kill|pskill)\b[^\n]*\b(?:csrss|lsass|wininit|winlogon|smss|services\.exe|svchost)"
+            r"(?:\.exe)?\b",
+            re.I,
+        ),
+        "kill a critical Windows process (that crashes or restarts the PC at once)",
+    ),
 )
 
 # A recursive-delete verb anywhere in the text, together with a whole-drive / user-profile /
@@ -394,7 +413,10 @@ _WIPE_TARGET_RE = re.compile(
     r"(?<![\w])[a-z]:[\\/]+users[\\/]+[^\\/\s\"']+[\\/]*\*?" + _END + r"|"     # C:\Users\<name>
     r"(?<![\w])[a-z]:[\\/]+users[\\/]+[^\\/\s\"']+[\\/]+(?:onedrive|documents|desktop|pictures|downloads)"
     r"[\\/]*\*?" + _END + r"|"
-    r"(?<![\w])/\*?" + _END + r"|expanduser|(?:%|\$env:)(?:onedrive|homepath)\b",
+    r"(?<![\w])/\*?" + _END + r"|expanduser|(?:%|\$env:)(?:onedrive|homepath)\b|"
+    # audit 2026-10-04: the Windows and Program Files folders themselves (Remove-Item C:\Windows\System32 -Recurse)
+    r"(?<![\w])[a-z]:[\\/]+(?:windows(?:[\\/]+system32)?|program files(?: \(x86\))?|programdata)[\\/]*\*?" + _END
+    + r"|%(?:windir|systemroot|programfiles)%|\$env:(?:windir|systemroot|programfiles)\b",
     re.I,
 )
 
@@ -570,7 +592,7 @@ def _take_pending_action(expect=None) -> dict | None:
 def _execute_confirmed_action(step: dict, reply_sink=None) -> None:
     tool_name = str(step.get("tool_name") or "")
     tool_input = step.get("tool_input") or {}
-    log.info("Confirmed by user: executing staged %s(%r)", tool_name, tool_input)
+    log.info("Confirmed by user: executing staged %s(%r)", tool_name, _redact_audit_input(tool_input))
     if step.get("batch"):
         reply = _run_confirmed_batch(tool_name, _pending_calls(step))
     else:
@@ -1477,24 +1499,27 @@ def _unsafe_open_target(tool_name: str, url) -> bool:
     return not u.startswith(ok)
 
 
-def _open_uri(uri: str) -> None:
+def _open_uri(uri: str) -> bool:
+    """True when it was handed to a browser/app (audit 2026-10-04: a failure was only logged, and open_url said
+    "Opened ..." anyway)."""
     u = uri.strip()
     if not u:
-        return
+        return False
     if not u.lower().startswith(("http://", "https://", "spotify:")):
         # Defence in depth (audit 2026-10-03): os.startfile runs a file path / shell: target as a program. Every
         # caller already checks; this keeps a future caller from forgetting.
         log.warning("Refused to open a non-web target: %r", u[:120])
-        return
+        return False
     if browsers.open_link(u):  # web links go to the main browser (JARVIS_BROWSER), not whatever Windows picks
-        return
+        return True
     try:
         if sys.platform == "win32":
             os.startfile(u)
-        else:
-            webbrowser.open(u)
+            return True
+        return bool(webbrowser.open(u))
     except OSError as e:
         log.warning("Could not open %s: %s", u, e)
+        return False
 
 
 # --- push-to-talk: Claude decides zero or more actions from a fixed, safe set ---------
@@ -2305,10 +2330,16 @@ AGENT_TOOLS = [
                     "type": "object",
                     "description": (
                         "optional — makes this skill run on its own, unprompted, speaking "
-                        "whatever it produces. Provide exactly one of the two properties below. "
-                        "Omit \"schedule\" entirely for a skill that only runs when asked."
+                        "whatever it produces. Provide exactly one of daily_at / every_minutes. "
+                        "Omit \"schedule\" for a new skill that only runs when asked; when UPDATING an existing "
+                        "skill, omitting it keeps the skill's current schedule, and {\"off\": true} stops it "
+                        "running on its own."
                     ),
                     "properties": {
+                        "off": {
+                            "type": "boolean",
+                            "description": "true = remove an existing skill's schedule (it then only runs when asked)",
+                        },
                         "daily_at": {
                             "type": "string",
                             "description": "24-hour local time, e.g. \"08:00\", to run once a day",
@@ -4687,7 +4718,8 @@ def queue_or_deliver_notification(
         log.info("Queued non-urgent notification (unrecognized person in view): %r", text)
         return
     kind = "reminder" if is_reminder else notify_priority.infer_kind(text)
-    if not (urgent or bypass_busy_gate or is_reminder) and _env_on("JARVIS_NOTIFY_SMART", True) and \
+    # `important` never waits for the hourly digest (audit 2026-10-04: a "meeting in 10 minutes" heads-up could).
+    if not (urgent or bypass_busy_gate or is_reminder or important) and _env_on("JARVIS_NOTIFY_SMART", True) and \
             notify_priority.should_batch(_memory_db_connect, _memory_db_lock, kind):
         # C6: a kind the user keeps cutting off waits for the hourly digest instead of interrupting.
         with _session_context_lock:
@@ -4696,7 +4728,9 @@ def queue_or_deliver_notification(
             _save_session_context_locked()
         log.info("Batched low-priority notification (%s) for the digest: %r", kind, text)
         return
-    if urgent or bypass_busy_gate or not (user_is_actively_working() and _is_preferred_work_hours()):
+    # `important` (a meeting about to start, a job the user asked for) is time-bound like a reminder: it must not
+    # wait for the next command just because the user is typing during work hours (audit 2026-10-04).
+    if urgent or bypass_busy_gate or important or not (user_is_actively_working() and _is_preferred_work_hours()):
         try:
             notify_priority.delivered(_memory_db_connect, _memory_db_lock, kind)
         except Exception as e:
@@ -5003,9 +5037,24 @@ def flush_pending_notifications() -> None:
             continue
         seen.add(key)
         try:
-            _speak_shaped(item.get("text", ""))
+            _speak_shaped(_held_text_with_time(item))
         except Exception as e:
             log.warning("Could not speak queued notification: %s", e)
+
+
+HELD_SAY_TIME_AFTER_S = 600
+
+
+def _held_text_with_time(item: dict, now: datetime | None = None) -> str:
+    """A held message read out later says when it came in (audit 2026-10-04: "In 10 minutes: Standup", held through
+    Focus Mode and read two hours later, sounded current)."""
+    text = str(item.get("text", ""))
+    when = _safe_parse_iso(item.get("queued_at"))
+    now = now or datetime.now()
+    if when is None or (now - when).total_seconds() < HELD_SAY_TIME_AFTER_S:
+        return text
+    stamp = when.strftime("%I:%M %p").lstrip("0") if when.date() == now.date() else when.strftime("%A %I:%M %p").replace(" 0", " ")
+    return f"Earlier, at {stamp}: {text}"
 
 
 def _reminders_held_now(urgent: bool = False) -> bool:
@@ -5225,6 +5274,18 @@ def send_windows_toast(title: str, message: str) -> bool:
 _NTFY_PRIORITIES = {"min": 1, "low": 2, "default": 3, "high": 4, "urgent": 5}
 
 
+PHONE_MAX_CHARS = 4000
+
+
+def _phone_cut(message: str) -> str:
+    """Phone messages are capped (Telegram's limit is 4096); a longer one now says it was cut (audit 2026-10-04: the
+    end of a long reply just vanished)."""
+    if len(message) <= PHONE_MAX_CHARS:
+        return message
+    note = "\n\n[cut here: the full reply is on the dashboard]"
+    return message[:PHONE_MAX_CHARS - len(note)].rstrip() + note
+
+
 def _ntfy_publish(message: str, title: str = "Jarvis", priority: str = "default") -> bool:
     """Best-effort push via ntfy's JSON publish endpoint (not the raw-body+headers form —
     headers can't safely carry arbitrary unicode, JSON can). Never raises.
@@ -5241,7 +5302,7 @@ def _ntfy_publish(message: str, title: str = "Jarvis", priority: str = "default"
     payload = json.dumps(
         {
             "topic": NTFY_TOPIC,
-            "message": message[:4000],
+            "message": _phone_cut(message),
             "title": title,
             "priority": _NTFY_PRIORITIES.get(priority, 3),
         }
@@ -5268,7 +5329,7 @@ def _telegram_send(message: str) -> bool:
     message = (message or "").strip()
     if not message:
         return False
-    payload = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": message[:4000]}).encode("utf-8")
+    payload = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": _phone_cut(message)}).encode("utf-8")
     try:
         req = urllib.request.Request(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -5337,6 +5398,18 @@ def _ntfy_listen_loop() -> None:
             time.sleep(5)
 
 
+TELEGRAM_STALE_S = 15 * 60  # a command older than this was sent while Jarvis was off: asked again, never just run
+
+
+def _telegram_ack(base: str, offset: int) -> None:
+    """Tell Telegram every update before `offset` was received (best effort; a failure only means a possible repeat)."""
+    try:
+        with urllib.request.urlopen(f"{base}/getUpdates?timeout=0&limit=1&offset={offset}", timeout=10) as resp:
+            resp.read()
+    except Exception as e:
+        log.debug("Telegram ack failed: %s", type(e).__name__)
+
+
 def _telegram_listen_loop() -> None:
     """Long-polls Telegram's getUpdates and runs each message through handle_text_command —
     but only from TELEGRAM_CHAT_ID; a message from any other chat is logged and dropped, since
@@ -5358,6 +5431,16 @@ def _telegram_listen_loop() -> None:
                 if chat_id != TELEGRAM_CHAT_ID:
                     if chat_id:
                         log.warning("Ignoring Telegram message from unauthorized chat %s", chat_id)
+                    continue
+                # Audit 2026-10-04: Telegram only counts an update as received at the NEXT getUpdates call, and the
+                # command runs before that. "restart yourself" / "update time" from the phone restarted Jarvis first,
+                # so the new copy fetched the same message again and restarted for ever. Confirm it, then run it.
+                _telegram_ack(base, offset)
+                age = time.time() - float(msg.get("date") or time.time())
+                if age > TELEGRAM_STALE_S and (text or _telegram_picture_id(msg)):
+                    log.info("Telegram message from %.0f min ago not run (Jarvis was offline).", age / 60)
+                    _telegram_send(f"I was offline when you sent \"{text[:60] or 'that picture'}\" "
+                                   f"({age / 60:.0f} minutes ago), so I didn't run it. Send it again if you still want it.")
                     continue
                 if text:
                     log.info("Telegram command received: %r", text)
@@ -5461,7 +5544,10 @@ def _parse_due_at(due_at: str) -> datetime | None:
     if not s:
         return None
     try:
-        return datetime.fromisoformat(s)
+        when = datetime.fromisoformat(s.replace("Z", "+00:00") if s.endswith("Z") else s)
+        # Audit 2026-10-04: "...Z" / "+01:00" was stored with its offset; due_at is compared as TEXT against local time
+        # (so it fired at the wrong hour) and a naive/aware comparison raised. Always local, naive.
+        return when.astimezone().replace(tzinfo=None) if when.tzinfo else when
     except ValueError:
         pass
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
@@ -5522,6 +5608,11 @@ def create_reminder(
             repeat = float(repeat_every_minutes)
         except (TypeError, ValueError):
             repeat = None
+        # audit 2026-10-05: 0.1 or a negative number re-armed it into the past, so it fired on every tick for ever
+        if repeat is not None and repeat <= 0:
+            repeat = None
+        elif repeat is not None:
+            repeat = max(repeat, MIN_REPEAT_MINUTES)
     now_iso = datetime.now().isoformat(timespec="seconds")
     with _memory_db_lock:
         conn = _memory_db_connect()
@@ -5647,6 +5738,24 @@ def cancel_reminder(reminder_id: int) -> str:
     return f"Cancelled reminder #{reminder_id}." if cur.rowcount else f"No active reminder #{reminder_id}."
 
 
+MIN_REPEAT_MINUTES = 1.0
+
+
+def _late_note(due_at: str | None, now: datetime) -> str:
+    """' (it was due at 9:00 AM)' for a reminder that fires late (audit 2026-10-04: after the PC was off, yesterday's
+    reminders all fired at boot as if they were due now)."""
+    due = _safe_parse_iso(due_at)
+    if due is None:
+        return ""
+    if due.tzinfo is not None:
+        due = due.astimezone().replace(tzinfo=None)
+    if (now - due).total_seconds() < HELD_SAY_TIME_AFTER_S:
+        return ""
+    when = due.strftime("%I:%M %p").lstrip("0") if due.date() == now.date() else \
+        due.strftime("%A %I:%M %p").replace(" 0", " ")
+    return f" (it was due at {when})"
+
+
 def _check_due_reminders(now: datetime) -> None:
     """Called once per scheduler tick. A due, non-repeating reminder is marked delivered; a
     repeating one is re-armed for now + its interval instead, so it keeps firing."""
@@ -5654,13 +5763,13 @@ def _check_due_reminders(now: datetime) -> None:
         conn = _memory_db_connect()
         try:
             rows = conn.execute(
-                "SELECT id, text, repeat_every_minutes, urgent FROM reminders "
+                "SELECT id, text, repeat_every_minutes, urgent, due_at FROM reminders "
                 "WHERE cancelled_at IS NULL AND delivered_at IS NULL AND due_at <= ?",
                 (now.isoformat(timespec="seconds"),),
             ).fetchall()
         finally:
             conn.close()
-    for rid, text, repeat, urgent in rows:
+    for rid, text, repeat, urgent, due_at in rows:
         # The toast fires immediately and unconditionally — unlike the spoken announcement,
         # a silent visual banner doesn't talk over anything, so it doesn't need to wait out
         # queue_or_deliver_notification's busy-gate to avoid being missed.
@@ -5670,7 +5779,7 @@ def _check_due_reminders(now: datetime) -> None:
                 send_windows_toast("Jarvis Reminder", text)
             # A reminder the user set must fire on time; only unprompted messages wait out the busy gate.
             queue_or_deliver_notification(
-                f"Reminder: {text}", urgent=bool(urgent), bypass_busy_gate=True, is_reminder=True
+                f"Reminder{_late_note(due_at, now)}: {text}", urgent=bool(urgent), bypass_busy_gate=True, is_reminder=True
             )
             record_recent_task(f"reminder delivered: {text}")
         except Exception as e:
@@ -5680,8 +5789,8 @@ def _check_due_reminders(now: datetime) -> None:
         with _memory_db_lock:
             conn = _memory_db_connect()
             try:
-                if repeat:
-                    next_due = (now + timedelta(minutes=float(repeat))).isoformat(timespec="seconds")
+                if repeat and float(repeat) > 0:  # a stored 0.1 / negative repeat must not fire every tick
+                    next_due = (now + timedelta(minutes=max(float(repeat), MIN_REPEAT_MINUTES))).isoformat(timespec="seconds")
                     conn.execute("UPDATE reminders SET due_at = ? WHERE id = ?", (next_due, rid))
                 else:
                     conn.execute(
@@ -5909,19 +6018,34 @@ def save_skill(
     try:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{slug}.json"
-        payload = {
-            "name": slug,
-            "description": (description or "").strip(),
-            "instructions": instructions,
-        }
+        # Updating a skill keeps every field the update doesn't replace (audit 2026-10-05: "check weekly releases in my
+        # morning briefing" rewrote the file with name/description/instructions only, silently dropping its 8:00
+        # schedule and "announce", so the briefing stopped running while the reply said "Saved").
+        payload: dict = {}
+        if path.is_file():
+            try:
+                old = json.loads(path.read_text(encoding="utf-8"))
+                payload = old if isinstance(old, dict) else {}
+            except (OSError, ValueError):
+                payload = {}
+        updating = bool(payload)
+        payload["name"] = slug
+        if (description or "").strip() or "description" not in payload:
+            payload["description"] = (description or "").strip()
+        payload["instructions"] = instructions
         if isinstance(schedule, dict) and (schedule.get("daily_at") or schedule.get("every_minutes")):
-            payload["schedule"] = schedule
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            payload["schedule"] = {k: v for k, v in schedule.items() if k != "off"}
+        elif isinstance(schedule, dict) and schedule.get("off"):
+            payload.pop("schedule", None)
+        tmp = path.with_name(path.name + ".tmp")  # never a half-written skill if Jarvis stops mid-save
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(path)
     except Exception as e:
         return f"Failed to save skill: {e}"
+    verb = "Updated" if updating else "Saved"
     if payload.get("schedule"):
-        return f"Saved skill {slug!r} to {path} (scheduled: {payload['schedule']})."
-    return f"Saved skill {slug!r} to {path}."
+        return f"{verb} skill {slug!r} at {path} (scheduled: {payload['schedule']})."
+    return f"{verb} skill {slug!r} at {path} (runs only when asked)."
 
 
 # --- proactive scheduler: a skill can carry an optional "schedule" so Jarvis acts on its own ---
@@ -5993,6 +6117,9 @@ def _schedule_gate_ok(schedule: dict, now: datetime) -> bool:
     return True
 
 
+DAILY_SKILL_CATCH_UP_HOURS = 6
+
+
 def _skill_is_due(skill: dict, now: datetime) -> bool:
     schedule = skill.get("schedule")
     if not isinstance(schedule, dict):
@@ -6009,6 +6136,14 @@ def _skill_is_due(skill: dict, now: datetime) -> bool:
         except (TypeError, ValueError):
             return False
         if now < target_today:
+            return False
+        # Audit 2026-10-04: a PC switched on at 11 pm ran (and spoke) the 8 am morning briefing. Like background
+        # agents, a daily skill catches up only within `catch_up_hours` (default 6) of its time; later it waits a day.
+        try:
+            catch_up = float(schedule.get("catch_up_hours", DAILY_SKILL_CATCH_UP_HOURS))
+        except (TypeError, ValueError):
+            catch_up = DAILY_SKILL_CATCH_UP_HOURS
+        if now - target_today > timedelta(hours=catch_up):
             return False
         return last_run is None or last_run.date() != now.date()
 
@@ -6126,6 +6261,7 @@ def _run_scheduled_skill(skill: dict) -> None:
     if not skill.get("announce"):
         synthetic_transcript += SKILL_QUIET_NOTE
     _command_ctx.scheduled_skill, _command_ctx.mail_shown = skill["name"], set()
+    _command_ctx.taint_watch, _command_ctx.outside_text_seen = True, False
     try:
         # An unprompted run must stay quiet when the model gives no text: never fall back to the
         # last tool's result (e.g. a remember_fact ack), and treat a bare "OK"/"Done." as silence.
@@ -6144,6 +6280,7 @@ def _run_scheduled_skill(skill: dict) -> None:
         log.warning("Scheduled skill %r failed: %s", skill["name"], e)
     finally:
         _command_ctx.scheduled_skill, _command_ctx.mail_shown = None, None
+        _command_ctx.taint_watch, _command_ctx.outside_text_seen = False, False
         _set_scheduled_task_running(False)
         _set_last_skill_run(skill["name"], datetime.now())
 
@@ -6157,6 +6294,7 @@ def _run_queued_task(description: str, instructions: str) -> None:
     instructions = (instructions or "").replace(UNTRUSTED_TASK_MARKER, "").strip()
     prev_untrusted = getattr(_command_ctx, "untrusted_origin", False)
     _command_ctx.untrusted_origin = untrusted
+    _command_ctx.taint_watch, _command_ctx.outside_text_seen = True, False
     _set_scheduled_task_running(True)
     record_recent_task(f"queued task: {description}")
     synthetic_transcript = (
@@ -6170,6 +6308,7 @@ def _run_queued_task(description: str, instructions: str) -> None:
             queue_or_deliver_notification(reply, important=not _command_ctx.untrusted_origin)
     finally:
         _command_ctx.untrusted_origin = prev_untrusted
+        _command_ctx.taint_watch, _command_ctx.outside_text_seen = False, False
         _set_scheduled_task_running(False)
 
 
@@ -6240,7 +6379,7 @@ _single_flight_lock = threading.Lock()
 # --- Email auto-replies (2026-10-03, jarvis_mail_reply): answers mail from the calendar and memory, sent automatically.
 # Known people (an address in memory, or anyone the owner has emailed) may get anything from memory and the calendar;
 # strangers get a polite reply with nothing personal. Paused in safe mode / when autonomy is hard-disabled.
-_mail_reply_state: dict = {"last": 0.0}
+_mail_reply_state: dict = {"last": None}  # None = never ran (monotonic() starts near 0 after a boot)
 _mail_reply_store: mail_reply.Store | None = None
 
 
@@ -6256,7 +6395,8 @@ def _mail_autoreply_tick(now: datetime) -> None:
         return
     if not {"mcp_gmail_search_emails", "mcp_gmail_read_email", "mcp_gmail_send_email"} <= set(_mcp_tool_index):
         return
-    if time.monotonic() - _mail_reply_state["last"] < mail_reply.interval_min() * 60:
+    last = _mail_reply_state["last"]
+    if last is not None and time.monotonic() - last < mail_reply.interval_min() * 60:
         return
     _mail_reply_state["last"] = time.monotonic()
     _run_single_flight("mail-autoreply", _mail_autoreply_cycle, now)
@@ -6272,7 +6412,10 @@ def _memory_email_addresses() -> set[str]:
 def _mail_reply_facts(query: str) -> str:
     """Only what the email is about (audit 2026-10-03: the newest 40 facts went into every known-person reply): the
     profile basics plus the facts that match the message."""
-    return (get_user_profile_context() + memory_enhance.relevant_memory_line(query, skip_newest=0)).strip()
+    text = (get_user_profile_context() + memory_enhance.relevant_memory_line(query, skip_newest=0)).strip()
+    # A fact holding a password, PIN, code or bank detail is never put in front of the model writing to someone else
+    # (audit 2026-10-04: the code check catches a written value, not one spelled out in words).
+    return "\n".join(line for line in text.splitlines() if not quickfacts._SENSITIVE_RE.search(line))
 
 
 def _mail_reply_calendar() -> str | None:
@@ -6386,12 +6529,23 @@ def _scheduler_loop() -> None:
 
 
 # --- Full autonomy wiring (jarvis_autonomy.py / jarvis_dynamic_tools.py) ---------------------------
-def _autonomy_run_agent(instruction: str) -> str:
+def _autonomy_set_email_scope(addresses) -> None:
+    """Autonomy says, just before run_agent, which addresses that run may email (None afterwards). Same thread."""
+    _command_ctx.next_email_scope = None if addresses is None else [str(a) for a in addresses]
+
+
+def _autonomy_run_agent(instruction: str, email_to: list[str] | None = None) -> str:
     """Runs one approved autonomous action through the normal agent loop (so its tools, audit trail and
-    the catastrophic confirmation gate all apply) and returns the reply."""
+    the catastrophic confirmation gate all apply) and returns the reply. The run may email only the addresses
+    autonomy checked against its limits, once (`email_to`, or what autonomy set with email_scope; none = no email)."""
+    if email_to is None:
+        email_to = getattr(_command_ctx, "next_email_scope", None)
     _set_scheduled_task_running(True)
     prev = getattr(_command_ctx, "autonomous", False)
     prev_untrusted = getattr(_command_ctx, "untrusted_origin", False)
+    prev_scope = (getattr(_command_ctx, "email_scope", None), getattr(_command_ctx, "email_sends", 0))
+    _command_ctx.email_scope = {a.lower() for a in (email_to or [])}
+    _command_ctx.email_sends = 0
     _command_ctx.autonomous = True
     # These actions are built from extracted data (often an email): never shell/python/typing (2026-09-27).
     _command_ctx.untrusted_origin = True
@@ -6405,6 +6559,7 @@ def _autonomy_run_agent(instruction: str) -> str:
     finally:
         _command_ctx.autonomous = prev
         _command_ctx.untrusted_origin = prev_untrusted
+        _command_ctx.email_scope, _command_ctx.email_sends = prev_scope
         _set_scheduled_task_running(False)
 
 
@@ -6881,7 +7036,9 @@ def build_daily_plan(now: datetime | None = None) -> list[dict]:
     with _memory_db_lock:
         conn = _daily_plan_db()
         try:
-            conn.execute("INSERT OR REPLACE INTO daily_plans (day, items_json, created_at) VALUES (?,?,?)",
+            # an upsert, not INSERT OR REPLACE: a refresh after the evening review erased that review (audit 2026-10-05)
+            conn.execute("INSERT INTO daily_plans (day, items_json, created_at) VALUES (?,?,?) ON CONFLICT(day) DO "
+                         "UPDATE SET items_json=excluded.items_json, created_at=excluded.created_at",
                          (now.date().isoformat(), json.dumps(plan), now.isoformat(timespec="seconds")))
             conn.commit()
         finally:
@@ -7135,14 +7292,20 @@ def _skills_tool(inp: dict) -> str:
             off.add(name.lower())
             settings.set_setting(SKILLS_OFF_KEY, ",".join(sorted(off)))
             return f"{name} comes with the Pro pack, so I turned it off instead of deleting it."
+        # Moved aside, not erased (audit 2026-10-04): a skill the owner wrote by hand is often not in git, and a
+        # mis-heard name would otherwise lose it for good.
+        bin_dir = path.parent / ".deleted"  # not loaded (skills are read from *.json in the folder itself); gitignored
         try:
-            path.unlink()
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            kept = bin_dir / f"{path.stem}-{datetime.now():%Y%m%d-%H%M%S}{path.suffix}"
+            os.replace(path, kept)
         except OSError as e:
             return f"Tool failed: couldn't delete {path.name}: {e}"
         off.discard(name.lower())
         settings.set_setting(SKILLS_OFF_KEY, ",".join(sorted(off)))
         _invalidate_read_caches()
-        return f"Deleted the {name} skill ({_skill_schedule_text(skill.get('schedule'))}); it won't run again."
+        return (f"Deleted the {name} skill ({_skill_schedule_text(skill.get('schedule'))}); it won't run again. "
+                f"(A copy is kept in {path.parent.name}/.deleted/{kept.name} in case you want it back.)")
     return f"Tool failed: unknown action {action!r}."
 
 
@@ -7772,7 +7935,7 @@ _agents_running: set = set()
 _agents_lock = threading.Lock()
 _agent_pending_lock = threading.Lock()
 _AGENT_FORBIDDEN_TOOLS = {"background_agents", "macros"}
-_kg_state = {"last": 0.0}
+_kg_state = {"last": None}  # None = never synced (monotonic() starts near 0 after a boot)
 _digest_state = {"last": time.monotonic()}
 
 
@@ -7936,7 +8099,7 @@ def _memory_search_tool(inp: dict) -> str:
 
 
 def _kg_sync_tick() -> None:
-    if time.monotonic() - _kg_state["last"] >= kg.SYNC_MIN * 60:
+    if _kg_state["last"] is None or time.monotonic() - _kg_state["last"] >= kg.SYNC_MIN * 60:
         _kg_state["last"] = time.monotonic()
         threading.Thread(target=lambda: kg.sync(_memory_db_connect, _memory_db_lock), daemon=True, name="kg-sync").start()
 
@@ -8121,7 +8284,9 @@ def _run_deferred_job(job: dict) -> None:
     _deferred_running.add(job["id"])  # (already added by _deferred_tick; kept for direct callers)
     prev = (getattr(_command_ctx, "source", None), getattr(_command_ctx, "autonomous", False))
     _command_ctx.source, _command_ctx.autonomous = DEFERRED_SOURCE, True
+    _command_ctx.taint_watch, _command_ctx.outside_text_seen = True, False
     _set_scheduled_task_running(True)
+    started = time.monotonic()
     session_id = dashboard.start_session("autonomy", transcript)
     dashboard.notify({"type": "session_start", "data": {"id": session_id, "source": "autonomy", "transcript": transcript}})
     _deferred_speech(f"Starting: {job['instruction'][:120]}")
@@ -8140,14 +8305,16 @@ def _run_deferred_job(job: dict) -> None:
         log.warning("Deferred job %s failed: %s", job["id"], e)
     finally:
         _command_ctx.source, _command_ctx.autonomous = prev
+        _command_ctx.taint_watch, _command_ctx.outside_text_seen = False, False
         _set_scheduled_task_running(False)
     try:
-        _finish_deferred_job(job, ok, reply, transient, transcript, session_id)
+        _finish_deferred_job(job, ok, reply, transient, transcript, session_id, started)
     finally:
         _deferred_running.discard(job["id"])  # last: "running" covers the result being recorded and reported
 
 
-def _finish_deferred_job(job: dict, ok: bool, reply: str, transient: bool, transcript: str, session_id) -> None:
+def _finish_deferred_job(job: dict, ok: bool, reply: str, transient: bool, transcript: str, session_id,
+                         started: float | None = None) -> None:
     # Only a transient failure (no model reachable, a crash) is retried: a run that finished and reported a
     # problem already did whatever it could, and doing it again could repeat its side effects.
     attempts = job["attempts"] if transient else deferred.MAX_ATTEMPTS
@@ -8157,7 +8324,11 @@ def _finish_deferred_job(job: dict, ok: bool, reply: str, transient: bool, trans
     _log_action_audit("deferred_job", {"id": job["id"], "attempt": job["attempts"], "status": status},
                       transcript, reply)
     _remember_deferred_job(job, status, reply)
-    if "staged, not run" in (reply or "") or _dashboard_get_pending():
+    pending = _dashboard_get_pending()
+    # Only an action this job staged (audit 2026-10-05: one the owner had staged earlier made every job that
+    # finished afterwards say urgently that it needed their yes).
+    staged_here = bool(pending) and (started is None or float(pending.get("queued_at") or 0) >= started)
+    if "staged, not run" in (reply or "") or staged_here:
         _deferred_speech(f"Scheduled job needs your yes: {reply[:200]}", urgent=True)
     elif status == "failed":
         tries = f" after {job['attempts']} tries" if job["attempts"] > 1 else ""
@@ -8207,13 +8378,69 @@ _UNTRUSTED_BLOCKED_TOOLS = {"run_shell", "run_python", "create_tool", "manage_dy
                             # stores and then mail them out (sending must stay allowed for autonomy's email actions).
                             "dashboard_data", "memory_search", "recall_facts", "quick_recall", "semantic_recall",
                             "knowledge_graph", "clipboard_history", "read_clipboard", "refactor_clipboard_code",
-                            "self_report", "lessons"}
+                            "self_report", "lessons",
+                            # Audit 2026-10-04: the built-in screen tools did what the blocked mcp_windows_* ones do
+                            # (read the screen, click, scroll, close windows), so an email could still drive the desktop.
+                            "read_screen", "click_at", "scroll_screen", "control_window",
+                            # ...and the ways to carry what a task read out to a server someone else picks (in a URL
+                            # or a request body): an email-started task reports to the owner, it has no need for them.
+                            "http_request", "download_image", "open_url", "play_media",
+                            # background work started from here would run later WITHOUT these limits
+                            "set_plan", "delegate_research",
+                            # ...and so would a saved skill (scheduled, full tools), while a remembered fact steers
+                            # every later prompt (a relationship fact with an address even joins the Sleep Mode
+                            # family auto-reply list): nothing from someone else's message is written there
+                            "save_skill", "remember_fact", "remember_decision", "remember_code_pattern",
+                            "update_project_status", "autonomy_skill",
+                            # a message to the owner's own phone comes from their trusted bot: an injected email could
+                            # use it to send them a phishing link (autonomy's own notices go through another path)
+                            "send_to_my_phone"}
 UNTRUSTED_TASK_MARKER = "[untrusted-origin]"
 
 
+_EMAIL_RUN_NO_FILES = {"read_file", "quick_search", "find_files", "code_search", "scan_large_files", "read_screen",
+                       "dev_tools", "analyze_code", "trace_dependencies"}
+
+
+# Audit 2026-10-04: a scheduled skill / job / queued task runs unattended with full tools, and some read other people's
+# text (gmail_watch reads mail hourly). Once such a run has read outside text, the rest of it can't run code, type,
+# drive the desktop, start the coding agent, save a skill or start background work: an injected email could otherwise
+# reach the shell. Email, reminders and everything else keep working, so the owner's own jobs still do their work.
+# Every connected (MCP) tool counts: mail, calendar invites, screen snapshots, an app's user-written content (posts,
+# shared documents) are all text someone else wrote.
+_OUTSIDE_TEXT_TOOL_RE = re.compile(r"^mcp_|^(?:http_request|web_search|browser_tabs|download_image|read_screen)$")
+_TAINT_BLOCKED_TOOLS = {"run_shell", "run_python", "type_text", "click_at", "control_window", "create_tool",
+                        "manage_dynamic_tool", "change_jarvis_code", "delegate_to_claude_code", "save_skill", "set_plan",
+                        "delegate_research",
+                        # memory steers every later prompt: an instruction hidden in a mail must not be written there
+                        "remember_fact", "remember_decision", "remember_code_pattern", "update_project_status"}
+
+
+def _taint_block(tool_name: str) -> str | None:
+    if getattr(_command_ctx, "outside_text_seen", False) and (
+            tool_name in _TAINT_BLOCKED_TOOLS or tool_name.startswith("mcp_windows_")):
+        return (f"Refused: {tool_name} can't run in this unattended task after it read other people's text "
+                "(mail, a web page); it could be a hidden instruction. Ask me directly if you want this.")
+    return None
+
+
+def _note_outside_text(tool_name: str) -> None:
+    if getattr(_command_ctx, "taint_watch", False) and _OUTSIDE_TEXT_TOOL_RE.search(tool_name):
+        _command_ctx.outside_text_seen = True
+
+
 def _untrusted_block(tool_name: str) -> str | None:
+    tainted = _taint_block(tool_name)
+    if tainted:
+        return tainted
+    # Audit 2026-10-04: an autonomous email reply goes back to the sender, who may be the one who wrote the injected
+    # text: during that run nothing of the owner's files may be read (a reply never needs them).
+    if getattr(_command_ctx, "email_scope", None) and tool_name in _EMAIL_RUN_NO_FILES:
+        return f"Refused: {tool_name} can't run while sending an automatic email (it could mail your files out)."
     if getattr(_command_ctx, "untrusted_origin", False) and (
-            tool_name in _UNTRUSTED_BLOCKED_TOOLS or tool_name.startswith("mcp_windows_")):
+            tool_name in _UNTRUSTED_BLOCKED_TOOLS or tool_name.startswith(("mcp_windows_", "mcp_whatsapp_", "mcp_browser_"))):
+        # mcp_whatsapp_*: an email must never read the owner's chats or send WhatsApp messages as them.
+        # mcp_browser_*: it can open any address (data in the link) or upload files, like http_request.
         return (f"Refused: {tool_name} can't run in a task that came from someone else's message or email "
                 "(it could be a hidden instruction). Ask me directly if you want this.")
     return None
@@ -8485,8 +8712,7 @@ def _browser_tabs_tool(inp: dict, confirmed: bool = False) -> str:
                 return f"Opened {url} in a new tab."
             except browser_bridge.BridgeError as e:
                 log.info("Browser tabs: open via the extension failed (%s); opening the normal way.", e)
-        _open_uri(url)
-        return f"Opened {url}."
+        return f"Opened {url}." if _open_uri(url) else f"Tool failed: couldn't open {url} (no browser answered)."
     if not online:
         return _tabs_setup_hint()
     name = bridge.browser_name() or browsers.label()
@@ -8752,6 +8978,7 @@ def _autonomy_callbacks() -> dict:
         "audit": _log_action_audit,
         "create_reminder": _autonomy_create_reminder,
         "run_agent": _autonomy_run_agent,
+        "email_scope": _autonomy_set_email_scope,
         "queue_task": lambda description, instructions, priority="normal", deadline=None: task_scheduler.queue_task(
             description, priority=priority if priority in task_scheduler.PRIORITY_LEVELS else "normal",
             instructions=instructions, deadline=deadline,
@@ -9510,25 +9737,31 @@ def start_prompt_cache_warmup() -> None:
         ).start()
 
 
-def _launch_app_notepad() -> None:
+def _launch_app_notepad() -> str | None:
     try:
         subprocess.Popen(["notepad.exe"])
     except OSError as e:
         log.warning("Could not open Notepad: %s", e)
+        return str(e)
+    return None
 
 
-def _launch_app_calculator() -> None:
+def _launch_app_calculator() -> str | None:
     try:
         subprocess.Popen(["calc.exe"])
     except OSError as e:
         log.warning("Could not open Calculator: %s", e)
+        return str(e)
+    return None
 
 
-def _launch_app_explorer() -> None:
+def _launch_app_explorer() -> str | None:
     try:
         subprocess.Popen(["explorer.exe"])
     except OSError as e:
         log.warning("Could not open File Explorer: %s", e)
+        return str(e)
+    return None
 
 
 def _launch_app_browser(which: str | None = None) -> str:
@@ -9602,29 +9835,33 @@ def _ensure_whatsapp_desktop(wait_s: float = 20.0) -> str | None:
             "Fall back to the mcp_windows_* UI tools.")
 
 
-def _launch_app(name: str) -> None:
+def _launch_app(name: str) -> str | None:
+    """Opens an allowed app. Returns why it failed (None = opened). Audit 2026-10-04: failures were only logged, so
+    open_app said "Opened notepad." when nothing opened."""
     if name == "whatsapp":
         problem = _ensure_whatsapp_desktop()
         if problem:
             log.warning("%s", problem)
-    elif name == "cursor":
+        return problem
+    if name == "cursor":
+        if not _cursor_executable():
+            return "Cursor isn't installed (or the `cursor` command isn't on the PATH)"
         open_cursor_window()
-    elif name == "notepad":
-        _launch_app_notepad()
-    elif name == "calculator":
-        _launch_app_calculator()
-    elif name == "explorer":
-        _launch_app_explorer()
-    elif name == "browser":
-        _launch_app_browser()
-    elif name == "opera":
-        _launch_app_browser("operagx")
-    elif name == "firefox":
-        _launch_app_browser("firefox")
-    elif name == "spotify":
+        return None
+    if name == "notepad":
+        return _launch_app_notepad()
+    if name == "calculator":
+        return _launch_app_calculator()
+    if name == "explorer":
+        return _launch_app_explorer()
+    if name in ("browser", "opera", "firefox"):
+        _launch_app_browser({"browser": None, "opera": "operagx", "firefox": "firefox"}[name])
+        return None
+    if name == "spotify":
         _launch_app_spotify()
-    else:
-        log.warning("Unknown app: %r", name)
+        return None
+    log.warning("Unknown app: %r", name)
+    return f"{name!r} is not a known app"
 
 
 def _launch_focus_app(name: str) -> None:
@@ -9633,13 +9870,17 @@ def _launch_focus_app(name: str) -> None:
     _launch_app(name)
 
 
-def _system_action_lock() -> None:
+def _system_action_lock() -> bool:
+    """True when Windows accepted the lock (LockWorkStation returns 0 on failure; it was ignored before 2026-10-04)."""
     if sys.platform != "win32":
         log.warning("Lock workstation is only implemented on Windows.")
-        return
+        return False
     import ctypes
 
-    ctypes.windll.user32.LockWorkStation()
+    ok = bool(ctypes.windll.user32.LockWorkStation())
+    if not ok:
+        log.warning("LockWorkStation failed (error %s).", ctypes.GetLastError())
+    return ok
 
 
 def _system_action_minimize_all() -> None:
@@ -9697,9 +9938,10 @@ def _send_vk_key(vk: int) -> None:
     user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
 
 
-def _run_system_action(name: str) -> None:
+def _run_system_action(name: str) -> str | None:
+    """None when done, else why not (only the lock can say it failed; the others give Windows no answer to check)."""
     if name == "lock":
-        _system_action_lock()
+        return None if _system_action_lock() else "Windows didn't lock the PC"
     elif name == "minimize_all":
         _system_action_minimize_all()
     elif name == "minimize_active":
@@ -9714,12 +9956,13 @@ sleep_mode.set_system_action_handler(_run_system_action)  # lets disable() undo 
 
 
 # --- screen interaction: click / drag / scroll / window focus -------------------------
-def click_at(x: int, y: int, button: str = "left", clicks: int = 1) -> None:
+def click_at(x: int, y: int, button: str = "left", clicks: int = 1) -> str | None:
+    """None when it clicked, else why not (audit 2026-10-04: a failure was only logged and the tool said "Clicked")."""
     try:
         import pyautogui
     except ImportError:
         log.warning("Install `pyautogui` (see requirements.txt) to click on screen.")
-        return
+        return "pyautogui isn't installed"
     pyautogui.FAILSAFE = True
     btn = button if button in ALLOWED_MOUSE_BUTTONS else "left"
     n = 2 if clicks == 2 else 1
@@ -9727,14 +9970,16 @@ def click_at(x: int, y: int, button: str = "left", clicks: int = 1) -> None:
         pyautogui.click(x=x, y=y, clicks=n, button=btn)
     except Exception as e:
         log.warning("Could not click at (%d, %d): %s", x, y, e)
+        return str(e) or type(e).__name__
+    return None
 
 
-def drag_and_drop(x: int, y: int, end_x: int, end_y: int, button: str = "left") -> None:
+def drag_and_drop(x: int, y: int, end_x: int, end_y: int, button: str = "left") -> str | None:
     try:
         import pyautogui
     except ImportError:
         log.warning("Install `pyautogui` (see requirements.txt) to drag on screen.")
-        return
+        return "pyautogui isn't installed"
     pyautogui.FAILSAFE = True
     btn = button if button in ALLOWED_MOUSE_BUTTONS else "left"
     try:
@@ -9742,14 +9987,16 @@ def drag_and_drop(x: int, y: int, end_x: int, end_y: int, button: str = "left") 
         pyautogui.dragTo(end_x, end_y, duration=0.3, button=btn)
     except Exception as e:
         log.warning("Could not drag (%d, %d) -> (%d, %d): %s", x, y, end_x, end_y, e)
+        return str(e) or type(e).__name__
+    return None
 
 
-def scroll_screen(amount: int, x: int | None = None, y: int | None = None) -> None:
+def scroll_screen(amount: int, x: int | None = None, y: int | None = None) -> str | None:
     try:
         import pyautogui
     except ImportError:
         log.warning("Install `pyautogui` (see requirements.txt) to scroll the screen.")
-        return
+        return "pyautogui isn't installed"
     pyautogui.FAILSAFE = True
     try:
         if x is not None and y is not None:
@@ -9758,6 +10005,8 @@ def scroll_screen(amount: int, x: int | None = None, y: int | None = None) -> No
             pyautogui.scroll(amount)
     except Exception as e:
         log.warning("Could not scroll: %s", e)
+        return str(e) or type(e).__name__
+    return None
 
 
 def focus_window(title_substring: str) -> bool:
@@ -10780,19 +11029,23 @@ def web_search_and_summarize(transcript: str, query: str) -> str:
     return _claude_text(data) or f"{results[0][0]}. {results[0][1]}"
 
 
-def type_text(text: str) -> None:
+def type_text(text: str) -> str | None:
+    """None when it typed, else why not (audit 2026-10-04: a failure was logged but the tool said "Typed N characters",
+    which then backed an "I've filled in the form" reply)."""
     t = text or ""
     if not t:
-        return
+        return None
     try:
         import keyboard
     except ImportError:
         log.warning("Install `keyboard` (see requirements.txt) to type text.")
-        return
+        return "the keyboard package isn't installed"
     try:
         keyboard.write(t)
     except Exception as e:
         log.warning("Could not type text: %s", e)
+        return str(e) or type(e).__name__
+    return None
 
 
 SHELL_TIMEOUT_S = 60
@@ -10860,6 +11113,9 @@ def _run_python_code(code: str) -> str:
         return f"Failed to run code: {e}"
 
 
+READ_FILE_MAX_CHARS = 2_000_000
+
+
 def _read_file_tool(path: str) -> str:
     if not path:
         return "No path given."
@@ -10868,11 +11124,20 @@ def _read_file_tool(path: str) -> str:
         return f"Refused to read {path}: {bad}."
     try:
         target = jarvis_workspace.resolve_read_path(path)
+        # The file actually opened is checked too (audit 2026-10-04): a workspace link pointing at .env passed the
+        # check on the name that was asked for.
+        bad = jarvis_workspace.sensitive_reason(str(target), write=False)
+        if bad:
+            return f"Refused to read {path}: {bad}."
         # Word/PDF/PowerPoint are zip/binary files: read as text they came back as gibberish, and the model burned
         # every agent step trying other ways to open them (found live 2026-10-02 with a table in a .docx).
         data = jarvis_docread.read_document(target)
         if data is None:
-            data = target.read_text(encoding="utf-8", errors="replace")
+            with open(target, encoding="utf-8", errors="replace") as f:  # bounded: a huge log no longer fills memory
+                data = f.read(READ_FILE_MAX_CHARS + 1)
+            if len(data) > READ_FILE_MAX_CHARS:
+                total = target.stat().st_size
+                return data[: MAX_TOOL_RESULT_CHARS * 2] + f"\n... [truncated, the file is about {total:,} bytes]"
     except Exception as e:
         return f"Failed to read {path}: {e}"
     if len(data) > MAX_TOOL_RESULT_CHARS * 2:
@@ -10887,6 +11152,37 @@ def _write_docx(p: Path, content: str, append: bool) -> None:
     jarvis_docx.write(p, content, append)
 
 
+KEEP_PREVIOUS_VERSIONS = 10
+
+
+def _keep_previous_version(p: Path) -> str:
+    """In a run nobody is watching (autonomy, a scheduled skill or job, a task from someone's email), overwriting an
+    existing file first keeps the old one in .jarvis-previous/ beside it (audit 2026-10-04: an overwrite was
+    unrecoverable). The owner's own commands overwrite as asked."""
+    watched = (_attended() or _current_command_source() == "phone") and not getattr(_command_ctx, "untrusted_origin", False)
+    if watched:
+        return ""
+    try:
+        if not p.is_file() or p.stat().st_size == 0:
+            return ""
+        keep_dir = p.parent / ".jarvis-previous"
+        keep_dir.mkdir(exist_ok=True)
+        kept = keep_dir / f"{p.stem}-{datetime.now():%Y%m%d-%H%M%S}{p.suffix}"
+        shutil.copy2(p, kept)
+        # Newest KEEP_PREVIOUS_VERSIONS per file (audit 2026-10-05: an hourly skill rewriting a report piled up copies).
+        mine = re.compile(re.escape(p.stem) + r"-\d{8}-\d{6}" + re.escape(p.suffix), re.I)
+        olds = sorted((f for f in keep_dir.iterdir() if mine.fullmatch(f.name)), key=lambda f: f.name, reverse=True)
+        for old in olds[KEEP_PREVIOUS_VERSIONS:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return f" (The previous version is kept at {kept}.)"
+    except OSError as e:
+        log.warning("Couldn't keep the previous version of %s: %s", p, e)
+        return ""
+
+
 def _write_file_tool(path: str, content: str, append: bool) -> str:
     if not path:
         return "No path given."
@@ -10895,8 +11191,11 @@ def _write_file_tool(path: str, content: str, append: bool) -> str:
         return refusal
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
+        kept = _keep_previous_version(p) if not append else ""
         if p.suffix.lower() == ".docx":
             _write_docx(p, content or "", append)
+            if kept:
+                return f"Wrote a Word document ({len(content or '')} chars) to {p}.{kept}"
             return f"{'Appended' if append else 'Wrote'} a Word document ({len(content or '')} chars) to {p}."
         if p.suffix.lower() == ".pptx":
             import jarvis_pptx
@@ -10904,7 +11203,7 @@ def _write_file_tool(path: str, content: str, append: bool) -> str:
             return f"{'Added to' if append else 'Wrote'} a PowerPoint deck ({n} slides) at {p}."
         with open(p, "a" if append else "w", encoding="utf-8") as f:
             f.write(content or "")
-        return f"{'Appended' if append else 'Wrote'} {len(content or '')} chars to {p}."
+        return f"{'Appended' if append else 'Wrote'} {len(content or '')} chars to {p}.{kept}"
     except Exception as e:
         return f"Failed to write {path}: {e}"
 
@@ -10919,6 +11218,9 @@ def _contains_secret(text: str) -> bool:
         if len(v or "") >= 8 and any(m in k.upper() for m in _SECRET_ENV_MARKERS) and v in text:
             return True
     return False
+
+
+HTTP_REQUEST_MAX_BYTES = 2_000_000
 
 
 def _http_request_tool(url: str, method: str, headers: dict | None, body: str | None) -> str:
@@ -10937,10 +11239,12 @@ def _http_request_tool(url: str, method: str, headers: dict | None, body: str | 
         )
         opener = urllib.request.build_opener(image_download._CheckedRedirects())
         with opener.open(req, timeout=20) as resp:
-            text = resp.read().decode(errors="replace")
+            # Bounded (audit 2026-10-04): the whole body used to be read before truncation, so a huge download could
+            # fill memory. A little over what the model is shown is enough to say it was cut.
+            text = resp.read(HTTP_REQUEST_MAX_BYTES).decode(errors="replace")
             status = resp.status
     except urllib.error.HTTPError as e:
-        text = e.read().decode(errors="replace") if e.fp else str(e)
+        text = e.read(HTTP_REQUEST_MAX_BYTES).decode(errors="replace") if e.fp else str(e)
         status = e.code
     except Exception as e:
         return f"Request failed: {e}"
@@ -11669,11 +11973,28 @@ def _set_plan(transcript: str, steps: list) -> str:
     )
 
 
-def _redact_audit_input(tool_input):
-    """The audit trail never stores a password value."""
-    if not isinstance(tool_input, dict):
+_SECRET_ARG_RE = re.compile(r"password|passcode|passwd|\bpin\b|_pin$|^pin|secret|token|api_?key|otp|cvv", re.I)
+
+
+def _is_secret_arg(key, value) -> bool:
+    """A secret-named argument holding a value (a count/limit such as max_tokens or token_count is not a secret)."""
+    k = str(key).lower()
+    if not _SECRET_ARG_RE.search(k) or isinstance(value, bool) or "count" in k or "max" in k:
+        return False
+    return isinstance(value, (str, int)) and str(value) != ""
+
+
+def _redact_audit_input(tool_input, depth: int = 0):
+    """The audit trail and the log never store a password / PIN / token value, however deep it sits (audit 2026-10-04:
+    only a top-level "password" key was hidden, and the log line printed the raw input)."""
+    if depth > 6:
         return tool_input
-    return {k: ("[hidden]" if "password" in str(k).lower() and v else v) for k, v in tool_input.items()}
+    if isinstance(tool_input, dict):
+        return {k: "[hidden]" if _is_secret_arg(k, v) else _redact_audit_input(v, depth + 1)
+                for k, v in tool_input.items()}
+    if isinstance(tool_input, list):
+        return [_redact_audit_input(v, depth + 1) for v in tool_input]
+    return tool_input
 
 
 def _log_action_audit(tool_name: str, tool_input: dict, transcript: str, result: str) -> None:
@@ -11768,10 +12089,18 @@ _ACTION_CLAIMS = [
      re.compile(r"type|fill|multiedit|paste|write_file", re.I)),  # write_file: "I've written the answer down in a note"
     ("clear those",  # found live 2026-10-02: "I've cleared those old reminders" after only list_reminders ran
      re.compile(r"\b(?:i'?ve|i have|i just|i)\s+(?:cleared|removed|deleted|cancelled|canceled|dismissed|closed|wiped)\b"
-                r"[^.!?]{0,40}\b(?:reminders?|deadlines?|overdue|commitments?|items?|tasks?|alerts?)\b"
+                r"[^.!?]{0,40}\b(?:reminders?|deadlines?|overdue|commitments?|items?|tasks?|alerts?"
+                # audit 2026-10-04: "I've cancelled your billing monitoring / turned off that skill" was never checked
+                r"|skills?|monitor(?:ing|s)?|routines?|macros?|jobs?)\b"
+                r"|\b(?:i'?ve|i have|i just|i)\s+(?:turned off|switched off|disabled|stopped)\b[^.!?]{0,40}"
+                r"\b(?:skills?|monitor(?:ing|s)?|routines?|macros?|jobs?|checks?)\b"
                 r"|\b(?:reminders?|deadlines?|commitments?|overdue items?)\b (?:have been |has been |were |was |are |is )?"
                 r"(?:cleared|removed|deleted|cancelled|canceled|closed)\b", re.I),
-     re.compile(r"cancel|complete|delete|remove|clear|autonomy|forget|dismiss", re.I)),
+     re.compile(r"cancel|complete|delete|remove|clear|autonomy|forget|dismiss|skills|macros|job|agents", re.I)),
+    ("close that",  # audit 2026-10-04: "I've closed the YouTube tab" with no tab/window tool behind it
+     re.compile(r"\b(?:i'?ve|i have|i just|i)\s+(?:closed|shut)\b[^.!?]{0,40}\b(?:tabs?|windows?)\b"
+                r"|\b(?:tabs?|windows?)\b (?:have been |has been |were |was |are |is )?closed\b", re.I),
+     re.compile(r"browser_tabs|control_window|close", re.I)),
     ("remember that",
      re.compile(r"\bi'?ll remember\b|\b(?:i'?ve|i have)\s+(?:noted|remembered|saved)\b[^.!?]{0,20}\b(?:that|it|this)\b"
                 r"[^.!?]{0,20}\b(?:memory|remember)?", re.I),
@@ -11824,11 +12153,17 @@ _ASKS_ABOUT_PAST_RE = re.compile(
     r"^\W*(?:ok(?:ay)?\W+|so\W+|and\W+|wait\W+)*(?:what|which|when|where|did|have|has|was|were|how|why|tell me what)\b"
     r"|\?\s*$", re.I)
 RECENT_BACKING_MINUTES = 30
+# "Can you send Sam the report?" ends with "?" but is a request, not a question about what happened (audit 2026-10-04:
+# a false "I've sent it" was then backed by an unrelated send from earlier). Only real questions about the past count.
+_POLITE_REQUEST_RE = re.compile(
+    r"^\W*(?:(?:hey|ok(?:ay)?)\W+)?(?:jarvis\W+)?(?:(?:can|could|would|will|wo?n'?t)\s+(?:you|u)\b|please\b|"
+    r"(?:send|email|text|message|reply|forward|set|create|add|remind|schedule|book|save|write|type|fill|delete|"
+    r"remove|cancel|clear|open|close|turn|switch|make|put|move|copy|run|start|stop)\b)", re.I)
 
 
 def _recent_succeeded_tools(transcript: str, minutes: int = RECENT_BACKING_MINUTES) -> list[str]:
     """Tools that succeeded in the user's earlier commands of the last few minutes (never autonomy's own runs)."""
-    if not _ASKS_ABOUT_PAST_RE.search(transcript or ""):
+    if not _ASKS_ABOUT_PAST_RE.search(transcript or "") or _POLITE_REQUEST_RE.search(transcript or ""):
         return []
     since = (datetime.now() - timedelta(minutes=minutes)).isoformat(timespec="seconds")
     try:
@@ -12138,6 +12473,80 @@ def _tool_schema(name: str) -> dict | None:
     return _schema_index["by_name"].get(name)
 
 
+def _mcp_scalars(value, depth: int = 0) -> list[str]:
+    """Every text/number inside an MCP tool's input, nested lists/objects included (audit 2026-10-04: only top-level
+    strings were checked, so Windows-MCP MultiEdit's [[x, y, "shutdown /s /t 0"]] skipped the catastrophic tripwire)."""
+    if depth > 6:
+        return []
+    if isinstance(value, dict):
+        return [t for v in value.values() for t in _mcp_scalars(v, depth + 1)]
+    if isinstance(value, (list, tuple)):
+        return [t for v in value for t in _mcp_scalars(v, depth + 1)]
+    return [str(value)] if isinstance(value, (str, int, float)) and not isinstance(value, bool) else []
+
+
+_MAIL_SEND_TOOL_RE = re.compile(r"^mcp_\w*?(?:gmail|mail|email|outlook)\w*?_(?:send|reply|forward)|send_?e?mail", re.I)
+_ADDR_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def _email_scope_problem(tool_name: str, inp: dict) -> str | None:
+    """In an autonomous email/calendar/file action (_autonomy_run_agent): a mail-send call may only go to the
+    recipients autonomy checked against its limits, and only once (audit 2026-10-04)."""
+    scope = getattr(_command_ctx, "email_scope", None)
+    if not _MAIL_SEND_TOOL_RE.search(tool_name):
+        return None
+    if scope is None:
+        # A queued task that came from someone's email ([untrusted-origin]) reports to the owner; it never needs to
+        # send mail, and could otherwise mail what it read to anyone.
+        if getattr(_command_ctx, "untrusted_origin", False):
+            return "Refused: a task that came from someone else's message can't send email. Ask me directly."
+        return None
+    if not scope:
+        return "Refused: this autonomous task may not send email."
+    addrs = {a.lower().rstrip(".") for a in _ADDR_RE.findall(" ".join(_mcp_scalars(inp)))}
+    extra = sorted(a for a in addrs if a not in scope)
+    if extra:
+        return f"Refused: this autonomous email may only go to {', '.join(sorted(scope))}, not {', '.join(extra)}."
+    if getattr(_command_ctx, "email_sends", 0) >= 1:
+        return "Refused: this autonomous task already sent its one email."
+    if any(re.search(r"attach", str(k), re.I) and v for k, v in (inp or {}).items()):
+        return "Refused: an automatic email can't carry attachments."
+    _command_ctx.email_sends = getattr(_command_ctx, "email_sends", 0) + 1
+    return None
+
+
+_MCP_FILE_KEY_RE = re.compile(r"attach|path|file", re.I)
+
+
+_MCP_WRITE_KEY_RE = re.compile(r"save|output|out_?path|dest|target|download", re.I)
+
+
+def _mcp_file_problem(value, depth: int = 0, filey: bool = False, writing: bool = False) -> str | None:
+    """A refusal when an MCP tool would read a credential / private file itself (audit 2026-10-04: Gmail's send_email
+    takes attachment PATHS and reads them, so an injected email could have .env or an SSH key mailed out, around
+    read_file's sensitive-path rules). Checks every string under a key that names a file/path/attachment."""
+    if depth > 6:
+        return None
+    if isinstance(value, dict):
+        for k, v in value.items():
+            # a path the tool WRITES to (savePath, outputPath...) gets the write rules: never the Startup folder,
+            # .git/.claude or Jarvis's own code folder (a downloaded file there would run later)
+            w = writing or bool(_MCP_WRITE_KEY_RE.search(str(k)))
+            hit = _mcp_file_problem(v, depth + 1, filey or w or bool(_MCP_FILE_KEY_RE.search(str(k))), w)
+            if hit:
+                return hit
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            hit = _mcp_file_problem(v, depth + 1, filey, writing)
+            if hit:
+                return hit
+    elif filey and isinstance(value, str) and value.strip():
+        bad = jarvis_workspace.sensitive_reason(value.strip(), write=writing)
+        if bad:
+            return f"Refused: {value.strip()!r}: {bad}."
+    return None
+
+
 def _execute_tool_impl(
     tool_name: str, tool_input: dict, transcript: str, skip_confirmation: bool = False
 ) -> str:
@@ -12165,9 +12574,12 @@ def _execute_tool_impl(
             # MCP tools can type into a terminal or Run box (Windows-MCP Type/Shortcut, the
             # browser), so their text goes through the same tripwire as run_shell/run_python.
             reason = None if skip_confirmation else (_catastrophic_reason(
-                " ".join(str(v) for v in inp.values() if isinstance(v, (str, int, float)))
+                " ".join(_mcp_scalars(inp))
             ) or _addon_confirm_reason(tool_name, inp))
-            if reason:
+            file_problem = _mcp_file_problem(inp) or _email_scope_problem(tool_name, inp)
+            if file_problem:
+                result = file_problem
+            elif reason:
                 if _queue_pending_confirmation(tool_name, dict(inp), reason):
                     result = (
                         f"That would {reason} — staged, not run. "
@@ -12203,26 +12615,27 @@ def _execute_tool_impl(
         elif tool_name == "open_url":
             url = str(inp.get("url") or "").strip()
             result = f"Opened {url}." if url else "No URL given."
-            if url:
-                _open_uri(url)
+            if url and not _open_uri(url):
+                result = f"Tool failed: couldn't open {url} (no browser answered)."
         elif tool_name == "play_media":
             url = str(inp.get("url") or "").strip()
             result = "Opened." if url else "No URL given."
-            if url:
-                _open_uri(url)
+            if url and not _open_uri(url):
+                result = f"Tool failed: couldn't open {url}."
         elif tool_name == "open_app":
             app = str(inp.get("app") or "").strip().lower()
             app = APP_ALIASES.get(app, app)
             if app in ALLOWED_APPS:
-                _launch_app(app)
-                result = f"Opened {browsers.label() if app == 'browser' else app}."
+                problem = _launch_app(app)
+                result = (f"Tool failed: couldn't open {app}: {problem}." if problem else
+                          f"Opened {browsers.label() if app == 'browser' else app}.")
             else:
                 result = f"{app!r} is not a known app."
         elif tool_name == "system_action":
             action = str(inp.get("system_action") or "").strip()
             if action in ALLOWED_SYSTEM_ACTIONS:
-                _run_system_action(action)
-                result = f"Ran system action {action}."
+                problem = _run_system_action(action)
+                result = f"Tool failed: {problem}." if problem else f"Ran system action {action}."
             else:
                 result = f"{action!r} is not a known system action."
         elif tool_name == "read_screen":
@@ -12239,8 +12652,8 @@ def _execute_tool_impl(
         elif tool_name == "type_text":
             text = str(inp.get("text") or "")
             if text:
-                type_text(text)
-                result = f"Typed {len(text)} characters."
+                problem = type_text(text)
+                result = f"Tool failed: couldn't type: {problem}." if problem else f"Typed {len(text)} characters."
             else:
                 result = "No text given."
         elif tool_name == "system_status":
@@ -12293,8 +12706,8 @@ def _execute_tool_impl(
             if x is not None and y is not None:
                 button = str(inp.get("button") or "left").strip().lower()
                 clicks = int(inp.get("clicks") or 1)
-                click_at(int(x), int(y), button=button, clicks=clicks)
-                result = f"Clicked at ({x}, {y})."
+                problem = click_at(int(x), int(y), button=button, clicks=clicks)
+                result = f"Tool failed: couldn't click: {problem}." if problem else f"Clicked at ({x}, {y})."
             else:
                 result = "Missing x/y."
         elif tool_name == "drag_and_drop":
@@ -12302,15 +12715,16 @@ def _execute_tool_impl(
             end_x, end_y = inp.get("end_x"), inp.get("end_y")
             if None not in (x, y, end_x, end_y):
                 button = str(inp.get("button") or "left").strip().lower()
-                drag_and_drop(int(x), int(y), int(end_x), int(end_y), button=button)
-                result = f"Dragged ({x}, {y}) to ({end_x}, {end_y})."
+                problem = drag_and_drop(int(x), int(y), int(end_x), int(end_y), button=button)
+                result = (f"Tool failed: couldn't drag: {problem}." if problem else
+                          f"Dragged ({x}, {y}) to ({end_x}, {end_y}).")
             else:
                 result = "Missing coordinates."
         elif tool_name == "scroll_screen":
             amount = inp.get("scroll_amount")
             if amount is not None:
-                scroll_screen(int(amount), x=inp.get("x"), y=inp.get("y"))
-                result = f"Scrolled {amount}."
+                problem = scroll_screen(int(amount), x=inp.get("x"), y=inp.get("y"))
+                result = f"Tool failed: couldn't scroll: {problem}." if problem else f"Scrolled {amount}."
             else:
                 result = "Missing scroll_amount."
         elif tool_name == "focus_window":
@@ -12556,11 +12970,18 @@ def _execute_tool_impl(
             rid = inp.get("reminder_id")
             result = cancel_reminder(int(rid)) if rid is not None else "Missing reminder_id."
         elif tool_name == "queue_task":
+            instructions = inp.get("instructions")
+            if instructions and (getattr(_command_ctx, "untrusted_origin", False)
+                                 or getattr(_command_ctx, "outside_text_seen", False)) and \
+                    UNTRUSTED_TASK_MARKER not in str(instructions):
+                # Audit 2026-10-04: queued from a task that came from someone's email, it would later run with full
+                # tools (shell included); it keeps the same limits.
+                instructions = f"{UNTRUSTED_TASK_MARKER} {instructions}"
             result = task_scheduler.queue_task(
                 str(inp.get("description") or ""),
                 estimate_minutes=inp.get("estimate_minutes"),
                 priority=str(inp.get("priority") or "normal"),
-                instructions=inp.get("instructions"),
+                instructions=instructions,
                 earliest_start=inp.get("earliest_start"),
                 deadline=inp.get("deadline"),
             )
@@ -12585,6 +13006,9 @@ def _execute_tool_impl(
             result = quick_recall()
         elif tool_name == "set_llm_provider":
             result = set_llm_provider(str(inp.get("provider") or ""))
+        elif tool_name == "restart_jarvis" and getattr(_command_ctx, "hands_free", False) \
+                and not getattr(_command_ctx, "wake", False):
+            result = "Tool failed: a restart heard in the hands-free window isn't taken; ask with push-to-talk or 'Hey Jarvis'."
         elif tool_name == "restart_jarvis":
             selfaware.record("system", "restart", "restart requested" + (" (forced)" if inp.get("force") else "")
                              + f" for: {(transcript or '').strip()[:120]}")
@@ -12719,11 +13143,12 @@ def _execute_tool_impl(
         log.warning("Tool %r raised: %s", tool_name, e)
         result = f"Tool failed: {e}"
 
+    _note_outside_text(tool_name)
     try:
         result = _verify_action(tool_name, inp, result)
     except Exception as e:  # a broken check must never break the action itself
         log.debug("Verification of %s skipped: %s", tool_name, e)
-    log.info("Tool %s(%r) -> %s", tool_name, inp, (result or "")[:200])
+    log.info("Tool %s(%r) -> %s", tool_name, _redact_audit_input(inp), (result or "")[:200])
     _log_action_audit(tool_name, inp, transcript, result)
     return result
 
@@ -13760,6 +14185,8 @@ def _run_read_only_tools_parallel(tool_uses: list[dict], transcript: str) -> dic
                 out[i] = f"Tool failed: {tool_uses[i].get('name')} did not answer in {PARALLEL_TOOL_TIMEOUT_S} seconds."
     finally:
         ex.shutdown(wait=False)
+    for i in idx:  # workers set flags on their own copy of the context: the outside-text mark must reach this run
+        _note_outside_text(tool_uses[i].get("name", ""))
     log.info("Ran %d read-only tools in parallel in %.2fs: %s", len(idx), time.monotonic() - t0,
              ", ".join(tool_uses[i].get("name", "") for i in idx))
     return out
@@ -14017,15 +14444,18 @@ def _restore_timers() -> None:
     for tid, name, label, ends_at in rows:
         try:
             ends = datetime.fromisoformat(ends_at)
-        except ValueError:
+        except (TypeError, ValueError):
+            # never re-armable: it would stay "running" for ever and count against the active-timer cap (audit 2026-10-05)
+            _timers_db("UPDATE timers SET status = 'cancelled' WHERE id = ?", (tid,))
             continue
         if ends > now:
             _schedule_timer(tid, label, name, ends)
         else:
             _timers_db("UPDATE timers SET status = 'done' WHERE id = ?", (tid,))
-            queue_or_deliver_notification(
-                f"Your {label} timer went off at {ends.strftime('%I:%M %p').lstrip('0')} while I wasn't running.",
-                urgent=True)
+            when = "at " + ends.strftime('%I:%M %p').lstrip('0')
+            if ends.date() != now.date():  # "went off at 3:05 PM" sounded like today
+                when = ("yesterday" if (now.date() - ends.date()).days == 1 else ends.strftime("%A %d %B")) + " " + when
+            queue_or_deliver_notification(f"Your {label} timer went off {when} while I wasn't running.", urgent=True)
     if rows:
         log.info("Restored %d timer(s).", len(rows))
 
@@ -14263,6 +14693,10 @@ def _git_pull_problem(output: str) -> str:
 
 
 def _update_and_restart_reply(transcript: str = "") -> str:
+    # The open follow-up window hears anything (a TV): like a hands-free "yes", it can't pull new code and restart
+    # Jarvis (audit 2026-10-04). Push-to-talk, "Hey Jarvis", typed, dashboard and phone still can.
+    if getattr(_command_ctx, "hands_free", False) and not getattr(_command_ctx, "wake", False):
+        return "To update and restart, hold push-to-talk (or say \"Hey Jarvis\") and ask again."
     if _current_command_source() != "phone":
         _start_announcement(UPDATE_ANNOUNCEMENT)
         _await_ack(8.0)

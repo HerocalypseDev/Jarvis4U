@@ -249,7 +249,10 @@ def safe_reply(reply: str, known: bool, sender: str) -> str | None:
     r = (reply or "").strip()
     if not r or len(r) > 2000:
         return None
-    if _SECRET_RE.search(r) and re.search(r"\d{4,}", r):
+    # Any value next to a secret word, not only 4+ digits (audit 2026-10-04: "the wifi password is Banana42", from a
+    # fact the owner saved, went out to a known sender). A reply never needs to give one.
+    if re.search(_SECRET_RE.pattern + r"\W{0,12}(?:is|was|:|=)?\W{0,6}[A-Za-z0-9!@#$%^&*._-]*\d", r, re.I) or \
+            (_SECRET_RE.search(r) and re.search(r"\d{4,}", r)):
         return None
     if not known:
         if _PHONE_RE.search(r) or any(a.lower() != sender for a in _EMAIL_RE.findall(r)):
@@ -294,7 +297,12 @@ def run_cycle(*, store: Store, mcp, claude, notify, record, now: datetime, own: 
             stats[outcome if outcome in stats else "skipped"] += 1
             if outcome == "dry_run":
                 _dry_seen.add(msg["id"])  # not marked handled: leaving dry-run answers it for real
-            elif outcome != "retry":  # a read that failed is tried again next cycle
+            elif outcome == "retry":  # a read that failed is tried again next cycle, but not for ever (audit 2026-10-04)
+                _read_failures[msg["id"]] = _read_failures.get(msg["id"], 0) + 1
+                if _read_failures[msg["id"]] >= MAX_READ_RETRIES:
+                    _read_failures.pop(msg["id"], None)
+                    store.mark(msg["id"], msg.get("sender") or "", "failed")
+            else:
                 store.mark(msg["id"], msg.get("sender") or "", outcome)
     finally:
         _cycle_lock.release()
@@ -304,6 +312,8 @@ def run_cycle(*, store: Store, mcp, claude, notify, record, now: datetime, own: 
 
 
 _dry_seen: set[str] = set()
+MAX_READ_RETRIES = 5
+_read_failures: dict[str, int] = {}  # message id -> failed reads (a message that never opens is given up on)
 
 
 def _handle(msg, store, mcp, claude, notify, record, after, own, memory_addresses, skip_senders, facts_text,

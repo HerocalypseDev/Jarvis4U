@@ -20,9 +20,14 @@ _CODE_DIR = Path(__file__).resolve().parent
 _SENSITIVE_NAMES = {
     "face.key", "credentials.json", "gcp-oauth.keys.json", "mcp_servers.json", "id_rsa", "id_ed25519",
     "id_ecdsa", "known_hosts", "jarvis_memory.db", "session_state.json", "llm_provider.json", "ntuser.dat",
+    # audit 2026-10-04: plaintext tokens other tools keep (git, npm, PyPI, netrc, GitHub CLI, Claude Code), the
+    # browser extension's pairing key, and Firefox's saved-password files
+    ".git-credentials", ".npmrc", ".pypirc", ".netrc", "_netrc", ".credentials.json", "pairing.json",
+    "logins.json", "key4.db", "login data", "cookies",
 }
 _SENSITIVE_SUFFIXES = (".pem", ".key", ".pfx", ".p12", ".kdbx", ".ppk")
-_SENSITIVE_DIRS = {".ssh", ".gnupg", ".aws", ".gmail-mcp", "google-calendar-mcp", "jarvis"}  # last = %LOCALAPPDATA%\Jarvis
+_SENSITIVE_DIRS = {".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", "gcloud", "github cli", ".gmail-mcp", "google-calendar-mcp",
+                   "jarvis"}  # last = %LOCALAPPDATA%\Jarvis
 _WRITE_ONLY_DIRS = {".claude", ".git", "startup"}
 
 
@@ -41,7 +46,8 @@ def sensitive_reason(path: str, write: bool = False) -> str | None:
     raw = (path or "").strip()
     if not raw:
         return None
-    p = Path(raw)
+    # A Windows path checked on another OS (tests, or a path quoted from the PC) still splits on its backslashes.
+    p = Path(raw.replace("\\", "/")) if os.sep == "/" else Path(raw)
     name, parents = _sensitive_parts(p)
     if name.startswith(".env") or name in _SENSITIVE_NAMES or name.endswith(_SENSITIVE_SUFFIXES) \
             or name.startswith(("face.db", "jarvis_memory.db")):
@@ -49,8 +55,11 @@ def sensitive_reason(path: str, write: bool = False) -> str | None:
     if any(part in _SENSITIVE_DIRS for part in parents if part != "jarvis" or "appdata" in parents):
         return "that folder holds credentials or Jarvis's private data"
     if write:
-        if any(part in _WRITE_ONLY_DIRS for part in parents):
+        # the folder itself counts too (a download "savePath" can name the Startup folder directly)
+        if any(part in _WRITE_ONLY_DIRS for part in parents + [name]):
             return "writing there could plant code that runs later (.git, .claude or the Startup folder)"
+        if os.sep == "/" and re.match(r"^[A-Za-z]:[\\/]", raw):
+            return None  # a Windows path checked elsewhere (tests): it can't be this machine's code folder
         try:
             rp = p.expanduser().resolve()
             if rp == _CODE_DIR or _CODE_DIR in rp.parents:
@@ -109,6 +118,15 @@ def classify(filename: str, content: str = "") -> str:
     if ext in _CODE_EXT:
         return "Code_Projects"
     return "Notes"
+
+
+def too_broad(path) -> bool:
+    """A whole drive or the whole user profile: too big for any tool that walks a folder tree (audit 2026-10-05)."""
+    try:
+        p = Path(path).expanduser().resolve()
+        return p.parent == p or p == Path.home().resolve()
+    except (OSError, RuntimeError):
+        return False
 
 
 def _inside(child: Path, parent: Path) -> bool:

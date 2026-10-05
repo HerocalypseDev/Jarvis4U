@@ -728,9 +728,12 @@ def _plausible_deadline(deadline: str | None) -> str | None:
     if not deadline:
         return None
     try:
-        dt = datetime.fromisoformat(deadline)
+        dt = datetime.fromisoformat(str(deadline).replace("Z", "+00:00"))
     except ValueError:
         return None
+    if dt.tzinfo:  # audit 2026-10-04: "...Z" raised comparing with local time; deadlines are stored local + naive
+        dt = dt.astimezone().replace(tzinfo=None)
+        deadline = dt.isoformat(timespec="seconds")
     if dt < _now() - timedelta(days=1) or dt > _now() + timedelta(days=MAX_DEADLINE_AHEAD_DAYS):
         return None
     return deadline
@@ -1191,7 +1194,8 @@ def build_calendar_args(props: dict, details: dict) -> dict:
         e_dt = datetime.fromisoformat(str(details.get("end_iso"))) if details.get("end_iso") else s_dt + timedelta(hours=1)
     except ValueError:
         e_dt = s_dt + timedelta(hours=1)
-    if e_dt <= s_dt:
+    # one with an offset and one without can't be compared (raised; audit 2026-10-04): take start + 1 h then
+    if (e_dt.tzinfo is None) != (s_dt.tzinfo is None) or e_dt <= s_dt:
         e_dt = s_dt + timedelta(hours=1)
 
     def pick(*names: str) -> str | None:
@@ -1332,6 +1336,8 @@ def _run_action(action_type: str | None, details: dict, commitment_id: int | Non
         blocked = _email_recipient_blocked(details) or _email_send_capped(details)
         if blocked:
             return False, blocked
+        if not _email_recipients(details):
+            return False, "email not sent: no recipient address to check the limits against"
     cal_note = ""
     if action_type == "calendar":
         direct, cal_note = _direct_calendar(details)
@@ -1354,7 +1360,14 @@ def _run_action(action_type: str | None, details: dict, commitment_id: int | Non
         else:
             instr = (f"Do exactly this file task and nothing more, using this data: {data}. "
                      "Reply in one short sentence." + guard)
-        res = _call("run_agent", instr, default=None)
+        # Audit 2026-10-04: the caps above checked `to`, but the agent run could send to any address in the data
+        # (body, description), send twice, or send mail during a calendar/file task. The run may now only send ONE
+        # email, to the checked recipients (none for calendar/file tasks); jarvis.py enforces it at the tool call.
+        _call("email_scope", _email_recipients(details) if action_type == "email" else [])
+        try:
+            res = _call("run_agent", instr, default=None)
+        finally:
+            _call("email_scope", None)
         text = str(res or "").strip()
         if res is None:
             return False, "no agent available"
