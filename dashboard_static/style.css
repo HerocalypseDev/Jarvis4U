@@ -672,6 +672,7 @@ input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.75); }
   text-decoration: none;
   transition: border-color var(--transition-fast), background var(--transition-fast), color var(--transition-fast), box-shadow var(--transition-fast);
 }
+.btn[hidden] { display: none; }
 .btn:hover { border-color: var(--color-accent); background: var(--color-accent-soft); }
 .btn:active { transform: translateY(1px); }
 .btn:focus-visible { outline: none; box-shadow: var(--focus-ring); }
@@ -1094,3 +1095,10 @@ p.consent-list { padding-left: 0; }
 .pro-col-head { font-weight: 600; text-transform: capitalize; margin-bottom: 6px; }
 .pro-card { background: var(--color-bg-tertiary); border: 1px solid var(--color-border); border-radius: var(--radius-sm, 6px);
   padding: 6px 8px; margin-top: 6px; font-size: 0.9rem; overflow-wrap: anywhere; }
+
+/* Caretaker route (2026-10-16) */
+#view-caretaker .view-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
+#view-caretaker .block-title { margin-top: var(--space-4); }
+.ct-issue-body { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+#ct-issues .list-item { display: flex; align-items: flex-start; gap: var(--space-3); }
+#view-caretaker .view-actions { display: inline-flex; gap: var(--space-2); }
