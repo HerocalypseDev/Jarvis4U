@@ -96,6 +96,7 @@ import jarvis_followup
 import jarvis_toolargs as toolargs
 import jarvis_doctor as doctor
 import jarvis_selfaware as selfaware
+import jarvis_selfmanage as selfmanage
 import jarvis_resilience
 import jarvis_wakeword
 import jarvis_weather as weather
@@ -134,6 +135,7 @@ import jarvis_browser_bridge as browser_bridge
 import jarvis_browser_tabs as browser_tabs
 import jarvis_context as reqctx
 import jarvis_missed as missed
+import jarvis_asks as asks_mod
 import jarvis_watches as watches_mod
 import jarvis_caretaker as caretaker
 import jarvis_caretaker_probe as caretaker_probe
@@ -1651,7 +1653,8 @@ def _open_uri(uri: str) -> bool:
 # --- push-to-talk: Claude decides zero or more actions from a fixed, safe set ---------
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 CLAUDE_API_VERSION = "2023-06-01"
-ALLOWED_APPS = ("cursor", "notepad", "calculator", "explorer", "browser", "opera", "firefox", "spotify", "whatsapp")
+ALLOWED_APPS = ("cursor", "notepad", "calculator", "explorer", "browser", "opera", "firefox", "spotify", "whatsapp",
+                "roblox")
 # "browser" = the main browser setting (JARVIS_BROWSER, Opera GX now); these names mean it too.
 APP_ALIASES = {"chrome": "browser", "google chrome": "browser", "edge": "browser", "web browser": "browser",
                "opera gx": "opera", "operagx": "opera", "mozilla": "firefox", "mozilla firefox": "firefox"}
@@ -1723,7 +1726,10 @@ reminder came from, look it up (autonomy action=origin for deadlines/commitments
 scheduled_jobs) and say what the record shows; if you find nothing, say you couldn't find it, never invent a source such as \
 "an automated parse". Say a deadline or task is cleared, cancelled or fixed only after the tool that does it ran and \
 succeeded. When you edit the owner's document, files are backed up first; when asked to put real figures (times, dates, \
-prices) into something, search for each one, write only what the search actually found, and say which ones you couldn't find.
+prices) into something, search for each one, write only what the search actually found, and say which ones you couldn't find. \
+Never say you are monitoring, watching or still checking something, or that you'll check again or let the user know \
+later, unless a job, watch, background agent, reminder or scheduled skill for it really exists (scheduled_jobs, watches \
+and the related-things line show them) or you just created one and it succeeded. If scheduling it failed, say so plainly.
 
 You have named tools for the common, well-understood things: opening apps/URLs, clicking, typing, \
 reading the screen or clipboard, web search, scanning for large files, and more — use \
@@ -1951,7 +1957,8 @@ AGENT_TOOLS = [
     {
         "name": "open_app",
         "description": ("Open or focus a known desktop application. browser = the user's main web browser (set in "
-                        "Settings; Opera GX now); opera / firefox open that browser by name."),
+                        "Settings; Opera GX now); opera / firefox open that browser by name; roblox = the Roblox "
+                        "app (roblox.com in the browser if the app isn't installed)."),
         "input_schema": {
             "type": "object",
             "properties": {"app": {"type": "string", "enum": list(ALLOWED_APPS)}},
@@ -3337,6 +3344,32 @@ if face.enabled():
 # tool prefix small. Handlers: _BATCH_TOOL_HANDLERS, dispatched from _execute_tool_impl.
 BATCH_TOOLS = [
     {
+        "name": "settings",
+        "description": (
+            "Read or change Jarvis's own settings, the same ones as the dashboard Settings page (wake word, follow-up "
+            "window, mail auto-reply, voices, budgets, hold keys, ...). action=get with query (words from the name, or "
+            "the exact name) shows matching settings with their value; action=list shows the curated ones; action=set "
+            "with name and value changes one and says whether it applies now or after a restart. Use this for ANY "
+            "request to turn a feature on or off or change a number or choice: never claim a setting changed without it. "
+            "Secrets, program paths, addresses, the camera and meeting recording are the owner's to change on the "
+            "Settings page; safe mode and personality go through their own tools (this one forwards them)."),
+        "input_schema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["get", "list", "set"]},
+            "query": {"type": "string"},
+            "name": {"type": "string"},
+            "value": {"type": "string"}}, "required": ["action"]},
+    },
+    {
+        "name": "stop_background_task",
+        "description": (
+            "Stop a background task that is running right now (started with delegate_to_claude_code, "
+            "delegate_research, change_jarvis_code or set_plan), the same as the Stop button on the dashboard Tasks "
+            "page. task_id from list_background_tasks; with no id and exactly one task running it stops that one, "
+            "otherwise it lists them and says to ask which. It does not touch queued tasks (cancel_queued_task) or "
+            "scheduled jobs (scheduled_jobs)."),
+        "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}},
+    },
+    {
         "name": "caretaker",
         "description": (
             "What Jarvis has noticed is wrong with the laptop or with itself, and what it has fixed. "
@@ -3533,7 +3566,8 @@ BATCH_TOOLS = [
             "{at 'HH:MM', days 'mon,tue'} | mail_match {query: Gmail search} | file_event {ext, name_contains} | "
             "manual, steps [{tool, input}] using existing tools; {subject}/{sender}/{path} fill in from the "
             "trigger, only in create_reminder/search-type steps; max_runs_per_day; enabled=false saves a new agent switched "
-            "off). Changing agents only works from the PC."
+            "off). Changing agents only works from the PC. An agent runs its steps exactly as given every time: it has "
+            "no 'if', can't compare a result and doesn't speak. For a check with a condition use schedule_jarvis_task."
         ),
         "input_schema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["list", "log", "run", "enable", "disable", "delete", "create"]},
@@ -3598,7 +3632,11 @@ BATCH_TOOLS = [
             "normal pipeline (tools, coding agent, email, research...). Use this whenever the user asks Jarvis to "
             "do something later ('in 30 minutes change the code in X', 'tonight send Sam the report', 'at 5 run "
             "the tests', 'in 10 minutes run a speed test'). Never use create_reminder for that: reminders only speak to the user. instruction = the "
-            "exact command in imperative form with all details (paths, names), never 'remind Jarvis to ...'."
+            "exact command in imperative form with all details (paths, names), never 'remind Jarvis to ...'. This is "
+            "what the user means by 'scheduled work' or 'a scheduled job'. For a repeated check ('every 10 minutes check "
+            "my speed; if it's above 10 tell me and open Roblox, else check again'), schedule ONE job: its instruction "
+            "runs the check, does the action and starts its reply with URGENT: when the condition is met, and otherwise "
+            "schedules this same instruction again in the same interval."
         ),
         "input_schema": {"type": "object", "properties": {
             "instruction": {"type": "string"}, "due_at": {"type": "string", "description": "local date/time"},
@@ -5273,6 +5311,77 @@ def _missed_since_line(started_at: str) -> str:
     return f" {n} other update{'s are' if n != 1 else ' is'} waiting: ask me what you missed."
 
 
+def _asks_line(query: str = "") -> str:
+    """Open questions Jarvis asked the user (jarvis_asks), for a command the user just gave. Remembers which ones were
+    shown, so the same tool succeeding in this command closes them."""
+    _command_ctx.shown_asks = []
+    if _current_command_source() not in asks_mod.ATTENDED or getattr(_command_ctx, "untrusted_origin", False):
+        return ""
+    try:
+        rows = asks_mod.open_asks(_memory_db_connect, _memory_db_lock)
+        m = re.match(r"Answer to your question #(\d+)\b", query or "")
+        named = [r for r in rows if m and r["id"] == int(m.group(1))]  # the Home card's answer box names its question
+        rows = named + [r for r in asks_mod.for_prompt(rows) if r not in named][:asks_mod.PROMPT_MAX - len(named)]
+        if not rows:
+            return ""
+        _command_ctx.shown_asks = [(r["id"], r["tool"]) for r in rows]
+        asks_mod.mark_shown(_memory_db_connect, _memory_db_lock, [r["id"] for r in rows])
+        return asks_mod.context_line(rows)
+    except Exception as e:
+        log.debug("open questions line skipped: %s", e)
+        return ""
+
+
+def _open_asks_waiting() -> bool:
+    try:
+        return bool(asks_mod.open_asks(_memory_db_connect, _memory_db_lock, limit=1))
+    except Exception:
+        return False
+
+
+def _close_shown_asks(tool: str, shown: list) -> None:
+    """A tool behind an open question (shown in this command's prompt) just went through: that question is answered."""
+    ids = [i for i, t in shown or () if t == tool]
+    if not ids:
+        return
+    try:
+        if asks_mod.close_for_tool(_memory_db_connect, _memory_db_lock, tool, ids):
+            dashboard.notify({"type": "asks_changed"})
+    except Exception as e:
+        log.debug("closing answered questions failed: %s", e)
+
+
+def _handle_pending_asks(transcript: str, reply: str, pending: list[dict]) -> str:
+    """End of a command whose tools need the user's answer (jarvis_asks). The user must hear the questions: a reply that
+    still doesn't ask gets them added in code. Each one is saved with the exact call, so the answer resumes it. A
+    background run says it out loud (held in Sleep/Focus) and it waits on the Home card (owner's choice 2026-10-16)."""
+    source = _current_command_source()
+    attended = source in asks_mod.ATTENDED
+    questions = " ".join(p["questions"] for p in pending)
+    if attended and not asks_mod.reply_asks(reply, questions):
+        reply = ((reply.strip() + "\n\n") if (reply or "").strip() else "") + asks_mod.fallback_text(pending)
+    if getattr(_command_ctx, "untrusted_origin", False) or (not attended and getattr(_command_ctx, "outside_text_seen", False)):
+        # The call's input may have been steered by someone else's text: never keep it for the user to "resume".
+        return reply
+    what = getattr(_command_ctx, "scheduled_skill", None)
+    what = f"your {str(what).replace('_', ' ')} skill" if what else "a background task"
+    for p in pending:
+        try:
+            _ask_id, new = asks_mod.save(_memory_db_connect, _memory_db_lock, tool=p["tool"], tool_input=p["input"],
+                                         questions=p["questions"], request=transcript if attended else what,
+                                         origin=source or "background")
+        except Exception as e:
+            log.warning("Couldn't save a question for the user: %s", e)
+            continue
+        if not attended and new:
+            queue_or_deliver_notification(asks_mod.spoken(p["questions"], what), important=True, bypass_busy_gate=True)
+    try:
+        dashboard.notify({"type": "asks_changed"})
+    except Exception:
+        pass
+    return reply
+
+
 def _missed_line() -> str:
     try:
         return missed.count_line(len(missed.unseen(_memory_db_connect, _memory_db_lock, limit=200)))
@@ -6629,7 +6738,7 @@ def _run_scheduled_skill(skill: dict) -> None:
     try:
         # An unprompted run must stay quiet when the model gives no text: never fall back to the
         # last tool's result (e.g. a remember_fact ack), and treat a bare "OK"/"Done." as silence.
-        reply = run_agent_loop(synthetic_transcript, tool_result_fallback=False)
+        reply = run_agent_loop(synthetic_transcript, tool_result_fallback=False, record_history=False)
         if reply:
             # Through the interrupt gate, never speak_text: URGENT: or an announce skill is spoken (Sleep/Focus/
             # visitor rules still apply); anything else lands in "what did I miss" (said in
@@ -6674,7 +6783,7 @@ def _run_queued_task(description: str, instructions: str) -> None:
     ) + QUEUED_TASK_QUIET_NOTE
     reply = None
     try:
-        reply = run_agent_loop(synthetic_transcript)
+        reply = run_agent_loop(synthetic_transcript, record_history=False)
         if reply:
             text, urgent_now = _skill_reply_urgency(reply)
             if text:
@@ -7764,6 +7873,8 @@ def _watches_tool(inp: dict) -> str:
         announce = watches_mod.clip(inp.get("announce"), 400)
         given = inp.get("schedule")
         schedule, note = watches_mod.parse_schedule(given) if given not in (None, "", {}) else (None, "")
+        if watches_mod.live_reading(what, rule):
+            return watches_mod.LIVE_READING_REDIRECT  # a repeated check of a reading is scheduled work, not a watch
         # Owner, 2026-10-06: a watch that isn't complete is never saved half-done; the user is asked again.
         asks = watches_mod.missing_parts(name, what, rule, given not in (None, "", {}), announce)
         if given not in (None, "", {}) and schedule is None:
@@ -7855,7 +7966,7 @@ def _run_watch(watch: dict, manual: bool = False) -> None:
     try:
         told = store.told(watch["id"])
         reply = run_agent_loop(watches_mod.check_prompt(watch, told, now, USER_NAME, manual=manual),
-                               tool_result_fallback=False)
+                               tool_result_fallback=False, record_history=False)
         alerts = None if reply is None or reply == _llm_unavailable_reply() else watches_mod.parse_alerts(reply)
         if reply is not None and reply != _llm_unavailable_reply() and alerts is None:
             status = "unreadable"
@@ -8214,6 +8325,39 @@ def _feature_missed(action: str, payload: dict):
     if action == "seen":
         n = missed.mark_seen(_memory_db_connect, _memory_db_lock)
         return {"result": f"Marked {n} as read."}
+    return None
+
+
+@_feature("asks")
+def _feature_asks(action: str, payload: dict):
+    """Home "Jarvis needs you" card (jarvis_asks, 2026-10-16): questions a tool needed the user to answer. Answering
+    runs a normal dashboard command carrying the question and the exact call, so Jarvis resumes that call."""
+    if action == "get":
+        rows = asks_mod.open_asks(_memory_db_connect, _memory_db_lock)
+        return {"items": [{"id": r["id"], "ts": r["ts"], "tool": r["tool"], "questions": r["questions"],
+                           "request": r.get("request") or "", "origin": r.get("origin") or ""} for r in rows]}
+    try:
+        ask_id = int((payload or {}).get("id"))
+    except (TypeError, ValueError):
+        return {"error": "say which question (id)"}
+    row = asks_mod.get(_memory_db_connect, _memory_db_lock, ask_id)
+    if not row or row["status"] != "open":
+        return {"error": "that question is no longer open"}
+    if action == "dismiss":
+        asks_mod.close(_memory_db_connect, _memory_db_lock, ask_id, "dismissed")
+        return {"result": "Dismissed."}
+    if action == "answer":
+        text = " ".join(str((payload or {}).get("text") or "").split())
+        if not text:
+            return {"error": "type an answer first"}
+        command = asks_mod.answer_command(row, text)
+
+        def _sink(reply: str) -> None:
+            dashboard.notify({"type": "command_reply", "data": {"text": command, "reply": reply}})
+
+        threading.Thread(target=lambda: handle_text_command(command, reply_sink=_sink, source="dashboard"),
+                         daemon=True, name=f"ask-answer-{ask_id}").start()
+        return {"result": "Sent. Jarvis is on it."}
     return None
 
 
@@ -8617,10 +8761,18 @@ def _background_agents_tool(inp: dict) -> str:
             return problem
     name = str(inp.get("name") or "").strip()
     if action == "create":
-        return agents.create(_agent_store, name, str(inp.get("trigger_type") or ""), inp.get("trigger_config") or {},
-                             inp.get("steps") or [], _agent_known_tools(), _AGENT_FORBIDDEN_TOOLS,
-                             inp.get("max_runs_per_day") or 24, enabled=inp.get("enabled", True) is not False,
-                             required=_agent_required_inputs())
+        result = agents.create(_agent_store, name, str(inp.get("trigger_type") or ""), inp.get("trigger_config") or {},
+                               inp.get("steps") or [], _agent_known_tools(), _AGENT_FORBIDDEN_TOOLS,
+                               inp.get("max_runs_per_day") or 24, enabled=inp.get("enabled", True) is not False,
+                               required=_agent_required_inputs())
+        if str(result).startswith("Agent "):
+            # 2026-10-16 debug report: an agent whose one step was speed_test was described as "notifying you on
+            # Telegram and opening Roblox when it goes above 10". Say what it really does, so the reply can't add more.
+            tools_run = ", ".join(str((st or {}).get("tool") or "?") for st in (inp.get("steps") or []) if isinstance(st, dict))
+            result += (f" Each run does only this: {tools_run or 'nothing'}. It has no conditions and doesn't speak, "
+                       "message or open anything unless one of those steps does. Tell the user exactly that; if they "
+                       "wanted 'only when X' or a message/app when something happens, use schedule_jarvis_task instead.")
+        return result
     a = _agent_store.get(name) if name else None
     if action in ("delete", "enable", "disable", "run", "log") and not a:
         return "No background agent by that name."
@@ -8925,7 +9077,9 @@ def _run_deferred_job(job: dict) -> None:
     try:
         reply = run_agent_loop(
             f"(Scheduled job #{job['id']}: "
-            + ("you scheduled this yourself earlier" if job.get("origin") == "jarvis"
+            + ("you scheduled this yourself earlier. Your reply is not said out loud unless it starts with "
+               "\"URGENT:\"; start with that only when the result is something the user asked to be told (a "
+               "condition they were waiting for was met), never for \"nothing changed yet\"" if job.get("origin") == "jarvis"
                else "the user asked earlier for this to be done at this time")
             + ". Do it now, "
             "fully, without asking them anything first; for a code change use change_jarvis_code (Jarvis's own "
@@ -8962,6 +9116,7 @@ def _finish_deferred_job(job: dict, ok: bool, reply: str, transient: bool, trans
     # Only an action this job staged (audit 2026-10-05: one the owner had staged earlier made every job that
     # finished afterwards say urgently that it needed their yes).
     staged_here = bool(pending) and (started is None or float(pending.get("queued_at") or 0) >= started)
+    flagged_text, flagged = _skill_reply_urgency(reply) if job.get("origin") == "jarvis" else ("", False)
     if "staged, not run" in (reply or "") or staged_here:
         _deferred_speech(f"Scheduled job needs your yes: {reply[:200]}", urgent=True)
     elif status == "failed":
@@ -8971,6 +9126,10 @@ def _finish_deferred_job(job: dict, ok: bool, reply: str, transient: bool, trans
         # Both come from the owner's own words (a direct request, or "Jarvis, at 5 do X" picked up from what they
         # said). Audit 2026-10-03: a "conversation" job finished in silence, not even in "what did I miss".
         _deferred_speech(f"As you asked earlier: {reply}", asked=True)
+    elif ok and flagged and flagged_text:
+        # Owner's choice 2026-10-16 ("speak when flagged"): a job Jarvis scheduled for itself (a self-rescheduling
+        # check) stays quiet, except when its run flags the result as something the owner asked to be told.
+        queue_or_deliver_notification(flagged_text, important=True, bypass_busy_gate=True)
     elif ok:
         _deferred_speech(f"Done: {job['instruction'][:80]}. {reply[:200]}")
 
@@ -9030,7 +9189,9 @@ _UNTRUSTED_BLOCKED_TOOLS = {"run_shell", "run_python", "create_tool", "manage_dy
                             "update_project_status", "autonomy_skill",
                             # a message to the owner's own phone comes from their trusted bot: an injected email could
                             # use it to send them a phishing link (autonomy's own notices go through another path)
-                            "send_to_my_phone"}
+                            "send_to_my_phone",
+                            # 2026-10-16: changing settings or stopping work is the owner's call, not an email's
+                            "settings", "stop_background_task"}
 UNTRUSTED_TASK_MARKER = "[untrusted-origin]"
 
 
@@ -9047,7 +9208,7 @@ _EMAIL_RUN_NO_FILES = {"read_file", "quick_search", "find_files", "code_search",
 _OUTSIDE_TEXT_TOOL_RE = re.compile(r"^mcp_|^(?:http_request|web_search|browser_tabs|download_image|read_screen)$")
 _TAINT_BLOCKED_TOOLS = {"run_shell", "run_python", "type_text", "click_at", "control_window", "create_tool",
                         "manage_dynamic_tool", "change_jarvis_code", "delegate_to_claude_code", "save_skill", "set_plan",
-                        "delegate_research", "caretaker",
+                        "delegate_research", "caretaker", "settings", "stop_background_task",
                         # memory steers every later prompt: an instruction hidden in a mail must not be written there
                         "remember_fact", "remember_decision", "remember_code_pattern", "update_project_status"}
 
@@ -9147,6 +9308,34 @@ def _dashboard_page_sessions(query: str = "") -> dict:
         q = query.lower()
         state["sessions"] = [s for s in state.get("sessions") or [] if q in json.dumps(s, default=str).lower()]
     return state
+
+
+def _dashboard_page_pending() -> dict:
+    pending = _dashboard_get_pending()
+    return pending or {"pending": None, "note": "Nothing is staged: no action is waiting for a yes."}
+
+
+_LOG_FILES = {"crash": "jarvis_crash.log", "standalone": "jarvis_standalone.log"}
+
+
+def _dashboard_page_logs(query: str = "") -> dict:
+    """Last lines of Jarvis's own logs, secrets masked. query = crash or standalone (default: both)."""
+    q = (query or "").strip().lower()
+    base = Path(__file__).resolve().parent
+    out = {}
+    for name, fname in _LOG_FILES.items():
+        if q and q not in name:
+            continue
+        path = base / fname
+        try:
+            size = path.stat().st_size
+            with open(path, "rb") as f:
+                f.seek(max(0, size - 12000))
+                tail = f.read().decode("utf-8", "replace").splitlines()[-40:]
+            out[name] = [jarvis_untrusted.mask_secrets(line)[0][:300] for line in tail]
+        except OSError:
+            out[name] = "(no such log yet)"
+    return out
 
 
 def _dashboard_page_autonomy() -> dict:
@@ -10142,6 +10331,8 @@ def _dashboard_pages() -> dict:
         "identity": (lambda q="": _dashboard_page_identity(), note("identity")),
         "memory": (lambda q="": list_memory(), note("memory")),
         "settings": (lambda q="": _dashboard_page_settings(), note("settings")),
+        "pending": (lambda q="": _dashboard_page_pending(), "the staged action waiting for your yes/Approve"),
+        "logs": (lambda q="": _dashboard_page_logs(q), "the end of Jarvis's own log files (query: which log, e.g. crash)"),
     }
     for key, fn in list(dashboard.providers.items()):
         if key.startswith("feature:"):
@@ -10221,8 +10412,89 @@ def _send_to_my_phone_tool(inp: dict) -> str:
     return f"Sent to your {' and '.join(sent)}: {text[:120]}{'...' if len(text) > 120 else ''}{note}"
 
 
+
+
+# --- Jarvis managing what the owner can manage (2026-10-16, "see and manage everything I can") -------------------
+def _owner_here_problem(what: str) -> str | None:
+    """Changing settings / stopping work: only for the owner's own command, never an automatic or email-started run."""
+    if getattr(_command_ctx, "untrusted_origin", False) or getattr(_command_ctx, "outside_text_seen", False):
+        return (f"Refused: {what} can't be done from a task that came from or read someone else's message, email or "
+                "web page (it could be a hidden instruction). Ask me directly.")
+    if not _owner_request_now():
+        return f"Tool failed: {what} needs the owner's own request (voice, typed, dashboard or phone)."
+    if getattr(_command_ctx, "hands_free", False) and not getattr(_command_ctx, "wake", False):
+        return f"Tool failed: {what} isn't taken from the hands-free window; ask with push-to-talk or 'Hey Jarvis'."
+    return None
+
+
+def _settings_tool(inp: dict) -> str:
+    action = str(inp.get("action") or "get").lower()
+    query = str(inp.get("query") or inp.get("name") or "").strip()
+    try:
+        listing = settings.list_settings()
+    except Exception as e:
+        return f"Tool failed: couldn't read the settings ({type(e).__name__})."
+    if action in ("get", "list"):
+        return selfmanage.listing_text(listing, "" if action == "list" else query)
+    if action != "set":
+        return "Tool failed: action must be get, list or set."
+    problem = _owner_here_problem("changing a setting")
+    if problem:
+        return problem
+    name = str(inp.get("name") or inp.get("query") or "").strip()
+    if "value" not in inp or inp.get("value") is None:
+        return "Tool failed: settings set needs 'value' (the new value). Ask the user what it should be."
+    value = str(inp.get("value")).strip()
+    matches = selfmanage.find(listing, name)
+    if not matches:
+        return f"Tool failed: no setting matches {name!r}. Use settings get with words from its name."
+    if len(matches) > 1:
+        return ("More than one setting matches " + repr(name) + "; ask the user which one: "
+                + "; ".join(r["key"] + (f" ({r['label']})" if r.get("label") else "") for r in matches))
+    row = matches[0]
+    key = row["key"]
+    if key == "JARVIS_SAFE_MODE":
+        return set_safe_mode(value.lower() in ("1", "true", "yes", "on"), _current_command_source())
+    if key == "JARVIS_PERSONALITY":
+        return _personality_tool({"action": "set", "name": value})
+    why = selfmanage.set_problem(row)
+    if why:
+        return f"Refused: {key} can't be changed by me, {why}."
+    before = row.get("value")
+    res = settings.set_setting(key, value)
+    if not res.get("ok"):
+        return f"Tool failed: {res.get('error')}"
+    return (f"{key} changed from {before if before not in (None, '') else '(empty)'} to {value or '(empty)'}; "
+            + ("it applies now." if res.get("applies") == "now" else "it applies after a restart (say 'restart yourself')."))
+
+
+def _stop_background_task_tool(inp: dict) -> str:
+    problem = _owner_here_problem("stopping a task")
+    if problem:
+        return problem
+    tid = inp.get("task_id")
+    with _background_tasks_lock:
+        live = sorted(_RUNNING_BACKGROUND_PROCS)
+    if tid in (None, ""):
+        if len(live) == 1:
+            tid = live[0]
+        elif not live:
+            return "Nothing is running that I can stop. " + list_background_tasks()
+        else:
+            return ("More than one task is running; ask the user which one to stop:\n" + list_background_tasks())
+    try:
+        tid = int(tid)
+    except (TypeError, ValueError):
+        return "Tool failed: task_id must be a number from list_background_tasks."
+    result = _dashboard_kill_background_task(tid)
+    if not result.startswith("Stopped"):
+        result = "Tool failed: " + result
+    return result
+
+
 _BATCH_TOOL_HANDLERS.update({"send_to_my_phone": _send_to_my_phone_tool, "skills": _skills_tool,
-                             "watches": _watches_tool, "personality": _personality_tool})
+                             "watches": _watches_tool, "personality": _personality_tool,
+                             "settings": _settings_tool, "stop_background_task": _stop_background_task_tool})
 
 
 # --- The user's real browser tabs (2026-10-03, owner request) -----------------------------------------------------
@@ -11138,6 +11410,7 @@ def build_system_blocks(tone_line: str = "", query: str = "") -> list[dict]:
         + _selfaware_line()
         + _recent_actions_line()
         + _missed_line()
+        + _asks_line(query)
         + chief.reply_style_line(os.environ.get("JARVIS_REPLY_STYLE"))
         + personality.prompt_line(_personality_name())
         + _relevant_memory_line(query)
@@ -11336,6 +11609,36 @@ def _launch_app_browser(which: str | None = None) -> str:
     return browsers.launch(which)
 
 
+ROBLOX_STORE_PACKAGE = "ROBLOXCORPORATION.ROBLOX_55nskbnwh6f9e"
+
+
+def _launch_roblox() -> str:
+    """Open Roblox (2026-10-16: the user's speed check wanted "open Roblox" and Jarvis opened the browser, there was no
+    Roblox app). The installed player's Start menu shortcut, else the Microsoft Store app, else roblox.com in the main
+    browser. The result says which, so a reply can't claim more than happened."""
+    if sys.platform != "win32":
+        return "Opened roblox.com in the browser (the Roblox app is Windows-only here)." if _open_uri(
+            "https://www.roblox.com/home") is not False else "Tool failed: couldn't open roblox.com."
+    appdata, local = os.environ.get("APPDATA", ""), os.environ.get("LOCALAPPDATA", "")
+    for lnk in (Path(appdata) / "Microsoft/Windows/Start Menu/Programs/Roblox/Roblox Player.lnk",
+                Path(os.environ.get("PROGRAMDATA", "")) / "Microsoft/Windows/Start Menu/Programs/Roblox/Roblox Player.lnk"):
+        try:
+            if lnk.is_file():
+                os.startfile(str(lnk))
+                return "Opened the Roblox app."
+        except OSError as e:
+            log.warning("Roblox shortcut didn't open: %s", e)
+    try:
+        if local and (Path(local) / "Packages" / ROBLOX_STORE_PACKAGE).is_dir():
+            subprocess.Popen(["explorer.exe", rf"shell:AppsFolder\{ROBLOX_STORE_PACKAGE}!App"])
+            return "Opened the Roblox app."
+    except OSError as e:
+        log.warning("Roblox Store app didn't open: %s", e)
+    if _open_uri("https://www.roblox.com/home") is False:
+        return "Tool failed: Roblox isn't installed and roblox.com didn't open."
+    return "The Roblox app isn't installed, so I opened roblox.com in the browser instead."
+
+
 def _launch_app_spotify() -> None:
     try:
         if sys.platform == "win32":
@@ -11427,6 +11730,9 @@ def _launch_app(name: str) -> str | None:
     if name == "spotify":
         _launch_app_spotify()
         return None
+    if name == "roblox":
+        result = _launch_roblox()
+        return result[len("Tool failed: "):] if result.startswith("Tool failed: ") else None
     log.warning("Unknown app: %r", name)
     return f"{name!r} is not a known app"
 
@@ -13273,7 +13579,7 @@ def _delegate_research(task: str, output_path: str) -> str:
 
     def _run() -> None:
         try:
-            reply = run_agent_loop(synthetic_transcript)
+            reply = run_agent_loop(synthetic_transcript, record_history=False)
         except Exception as e:
             _finish_background_task(task_id, "failed", f"research task raised an error: {e}")
             return
@@ -13672,34 +13978,40 @@ _FAILED_RESULT_PREFIXES = ("couldn't", "could not", "no results", "unrecognized"
 # ("I've set a reminder", "I sent the email") when no tool that does that ran this turn gets one
 # extra round to actually do it; if it still doesn't, the reply says plainly that it didn't happen.
 # Each entry: (what it claims, claim regex, regex over the names of tools that would back it).
+# "I have successfully created the Word document" (debug report 2026-10-16) slipped past every claim below: an adverb
+# between "I have" and the verb broke the match, after two failed saves.
+_I_DID = (r"\b(?:i'?ve|i have|i just|i)\s+(?:(?:successfully|already|now|also|finally|just|actually|quickly|then|"
+          r"gone ahead and|went ahead and)\s+)*")
 _ACTION_CLAIMS = [
     ("set that reminder",
-     re.compile(r"\b(?:i'?ve|i have|i just|i)\s+(?:set|created|added|scheduled|made)\b[^.!?]{0,30}\breminders?\b"
+     re.compile(_I_DID + r"(?:set|created|added|scheduled|made)\b[^.!?]{0,30}\breminders?\b"
                 r"|\breminders?\b (?:is |has been |was )?(?:set|created|scheduled)\b|\bi'?ll remind you\b", re.I),
      re.compile(r"create_reminder|schedule_jarvis_task|queue_task|timer|alarm|background_agents", re.I)),
     ("send that",
-     re.compile(r"\b(?:i'?ve|i have|i just|i)\s+(?:sent|emailed|messaged|texted|replied|forwarded)\b"
+     re.compile(_I_DID + r"(?:sent|emailed|messaged|texted|replied|forwarded)\b"
                 r"|\b(?:email|message|reply|text)\b (?:has been |was |is )?sent\b", re.I),
      re.compile(r"send|forward|type|click|press|shortcut", re.I)),
     ("add that to your calendar",
-     re.compile(r"\b(?:i'?ve|i have|i just|i)\s+(?:added|put|scheduled|booked|created)\b[^.!?]{0,40}\b(?:calendar|event|meeting)\b"
+     re.compile(_I_DID + r"(?:added|put|scheduled|booked|created)\b[^.!?]{0,40}\b(?:calendar|event|meeting)\b"
                 r"|\b(?:event|meeting)\b (?:has been |was |is )?(?:created|added|scheduled|booked)\b", re.I),
      re.compile(r"(?:calendar|event).*(?:create|insert|add|update|quick)|(?:create|insert|add|update|quick).*(?:calendar|event)", re.I)),
     ("save that file",
-     re.compile(r"\b(?:i'?ve|i have|i just|i)\s+(?:saved|written|wrote|created)\b[^.!?]{0,40}"
-                r"\b(?:file|document|doc|docx|note|notes|folder|presentation|spreadsheet|pptx)\b", re.I),
+     re.compile(_I_DID + r"(?:saved|written|wrote|created)\b[^.!?]{0,40}"
+                r"\b(?:file|document|doc|docx|note|notes|folder|presentation|spreadsheet|pptx)\b"
+                r"|\b(?:file|document|docx|presentation|spreadsheet)\b (?:has been |was |is )(?:now )?(?:saved|created|written)\b",
+                re.I),
      re.compile(r"write|save|create|delegate|change_jarvis_code|move|copy|rename|organise|edit", re.I)),
     ("type that in",
-     re.compile(r"\b(?:i'?ve|i have|i just|i)\s+(?:[a-z ,]{0,40}\band\s+)?(?:typed|written|wrote|filled|entered|put|pasted|inserted)\b"
+     re.compile(_I_DID + r"(?:[a-z ,]{0,40}\band\s+)?(?:typed|written|wrote|filled|entered|put|pasted|inserted)\b"
                 r"[^.!?]{0,110}\b(?:form|fields?|box(?:es)?|space|answer boxes|browser|page|screen|text ?box|application|answers?)\b"
                 r"|\b(?:form|fields?|answers?) (?:has been |have been |was |were |is |are )?(?:filled|typed|written|entered)\b", re.I),
      re.compile(r"type|fill|multiedit|paste|write_file", re.I)),  # write_file: "I've written the answer down in a note"
     ("clear those",  # found live 2026-10-02: "I've cleared those old reminders" after only list_reminders ran
-     re.compile(r"\b(?:i'?ve|i have|i just|i)\s+(?:cleared|removed|deleted|cancelled|canceled|dismissed|closed|wiped)\b"
+     re.compile(_I_DID + r"(?:cleared|removed|deleted|cancelled|canceled|dismissed|closed|wiped)\b"
                 r"[^.!?]{0,40}\b(?:reminders?|deadlines?|overdue|commitments?|items?|tasks?|alerts?"
                 # audit 2026-10-04: "I've cancelled your billing monitoring / turned off that skill" was never checked
                 r"|skills?|monitor(?:ing|s)?|routines?|macros?|jobs?)\b"
-                r"|\b(?:i'?ve|i have|i just|i)\s+(?:turned off|switched off|disabled|stopped)\b[^.!?]{0,40}"
+                r"|" + _I_DID + r"(?:turned off|switched off|disabled|stopped)\b[^.!?]{0,40}"
                 r"\b(?:skills?|monitor(?:ing|s)?|routines?|macros?|jobs?|checks?)\b"
                 r"|\b(?:reminders?|deadlines?|commitments?|overdue items?)\b (?:have been |has been |were |was |are |is )?"
                 r"(?:cleared|removed|deleted|cancelled|canceled|closed)\b", re.I),
@@ -13707,18 +14019,18 @@ _ACTION_CLAIMS = [
     # Debug report 2026-10-07: "I have gone ahead and cleared it straight out of your deadlines list" / "That task is
     # completely wiped out" were said after only look-ups ran, and slipped past the wording above.
     ("clear that",
-     re.compile(r"\b(?:i'?ve|i have|i just|i)\s+(?:gone ahead and |already |successfully |now )*(?:cleared|removed|deleted|"
+     re.compile(_I_DID + r"(?:gone ahead and |already |successfully |now )*(?:cleared|removed|deleted|"
                 r"cancelled|canceled|wiped|dismissed)\b[^.!?]{0,40}\b(?:it|that|those|this|them)\b"
                 r"|\b(?:it|that|this|those|task|deadline|commitment|reminder|coffee \w+)\b[^.!?]{0,25}\b(?:is|are|has been|have been)\s+"
                 r"(?:now |all )?(?:completely |fully |totally )?(?:wiped out|gone|cleared|cancelled|canceled|removed|deleted)\b", re.I),
      re.compile(r"cancel|complete|delete|remove|clear|autonomy|forget|dismiss|skills|macros|job|agents|reminder", re.I)),
     ("look that up",  # said it searched / used the real figures when no search ran (the invented anime times)
-     re.compile(r"\b(?:i'?ve|i have|i just|i)\s+(?:gone back into [^.!?,]{0,40}[, ]+(?:and )?)?(?:searched|looked up|looked online|checked online|"
+     re.compile(_I_DID + r"(?:gone back into [^.!?,]{0,40}[, ]+(?:and )?)?(?:searched|looked up|looked online|checked online|"
                 r"tracked down|researched|found)\b[^.!?]{0,60}\b(?:real|actual|exact|premiere|release|broadcast|air(?:ing)?|online|"
                 r"web|internet|times?|dates?|schedule)\b", re.I),
      re.compile(r"web_search|http_request|browser|fetch|^mcp_|dashboard_data", re.I)),  # not quick_search/memory_search
     ("close that",  # audit 2026-10-04: "I've closed the YouTube tab" with no tab/window tool behind it
-     re.compile(r"\b(?:i'?ve|i have|i just|i)\s+(?:closed|shut)\b[^.!?]{0,40}\b(?:tabs?|windows?)\b"
+     re.compile(_I_DID + r"(?:closed|shut)\b[^.!?]{0,40}\b(?:tabs?|windows?)\b"
                 r"|\b(?:tabs?|windows?)\b (?:have been |has been |were |was |are |is )?closed\b", re.I),
      re.compile(r"browser_tabs|control_window|close", re.I)),
     ("remember that",
@@ -13747,7 +14059,7 @@ def _confirmation_imitated(reply_text: str) -> bool:
         return _pending_action is None
 
 
-def _unbacked_claims(reply_text: str, used_tool_names: list[str]) -> list[str]:
+def _unbacked_claims(reply_text: str, used_tool_names: list[str], transcript: str | None = None) -> list[str]:
     """What the reply claims to have done, past tense, with no tool of that kind run this turn.
     Questions and offers ("Shall I set a reminder?") are ignored."""
     # Only tools that DO something count as proof (audit 2026-09-28): list_reminders, read_file,
@@ -13765,6 +14077,8 @@ def _unbacked_claims(reply_text: str, used_tool_names: list[str]) -> list[str]:
                 out.append(what)
     if "clear those" in out and "clear that" in out:
         out.remove("clear that")  # one claim, reported once
+    if transcript is not None and _ongoing_claim_unbacked(reply_text, doers, transcript):
+        out.append(_ONGOING_UNBACKED)
     if _confirmation_imitated(reply_text):
         out.append(_CONFIRMATION_IMITATION)
     return out
@@ -13821,7 +14135,73 @@ def _recent_succeeded_tools(transcript: str, minutes: int = RECENT_BACKING_MINUT
     return out
 
 
+# Owner report 2026-10-16: a self-rescheduling speed check couldn't schedule its next run, and half an hour later
+# Jarvis still said "I'm still monitoring it for you". A claim of ONGOING work (monitoring, will check again, will let
+# you know when) needs something that really keeps running: a pending job, an enabled watch or background agent, a
+# scheduled skill, a reminder, a queued or running background task, or a scheduling tool that succeeded this turn.
+_ONGOING_CLAIM_RE = re.compile(
+    r"\b(?:i'?m|i am)\s+(?:still\s+|now\s+|currently\s+|already\s+|actively\s+)*(?:monitoring|watching|tracking|"
+    r"keeping (?:an )?eye on|keeping track of|keeping tabs on|checking on)\b"
+    r"|\b(?:i'?ll|i will)\s+(?:keep|continue)\s+(?:on\s+)?(?:monitoring|watching|tracking|checking|testing|"
+    r"an eye|tabs|track|trying|looking|running)"
+    r"|\b(?:i'?ll|i will)\s+(?:check|test|look|try|run)\b[^.!?]{0,40}\bagain\b[^.!?]{0,20}\b(?:in|every|after|later)\b"
+    r"|\b(?:i'?ll|i will)\s+(?:let you know|tell you|notify you|alert you|ping you|text you|message you)\b[^.!?]{0,50}"
+    r"\b(?:when|once|as soon as|the moment)\b"
+    r"|\b(?:monitoring|the (?:watch|check|job))\s+(?:is|are)\s+(?:still\s+)?(?:active|running|on|in place|set up)\b",
+    re.I)
+_SCHEDULING_TOOL_RE = re.compile(r"schedule|watch|agent|save_skill|reminder|queue|set_plan|delegate|change_jarvis_code"
+                                 r"|timer|macros", re.I)
+_ONGOING_FILLER = reqctx.content_words(
+    "monitoring monitor watching watch tracking track keeping keep eye tabs checking check still continue let know "
+    "notify alert ping update again minutes minute hours hour every later soon once moment active running set up "
+    "for you your currently actively")
+_ONGOING_UNBACKED = "set anything up to keep checking that: nothing is scheduled for it"
+
+
+def _active_scheduled_work() -> list[str]:
+    """Texts of everything that really keeps running for the owner right now (each a short description)."""
+    out: list[str] = []
+    for sql in ("SELECT instruction FROM autonomy_deferred_jobs WHERE status='pending'",
+                "SELECT name || ' ' || what || ' ' || rule FROM watches WHERE enabled=1",
+                "SELECT name || ' ' || steps FROM agents WHERE enabled=1",
+                "SELECT text FROM reminders WHERE delivered_at IS NULL AND cancelled_at IS NULL",
+                "SELECT description || ' ' || COALESCE(instructions, '') FROM task_queue "
+                "WHERE status IN ('pending','scheduled')",
+                "SELECT task FROM background_tasks WHERE status='running'"):
+        out += [str(r[0] or "") for r in _related_rows(sql)]
+    try:
+        out += [f"{sk.get('name', '')} {sk.get('description', '')} {sk.get('instructions', '')}"
+                for sk in _active_skills() if sk.get("schedule")]
+    except Exception as e:
+        log.debug("scheduled skills lookup skipped: %s", e)
+    return out
+
+
+def _ongoing_claim_unbacked(reply_text: str, doers: list[str], transcript: str) -> bool:
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", reply_text or "")
+                 if _ONGOING_CLAIM_RE.search(s) and not s.rstrip().endswith("?")
+                 and not re.search(r"\b(?:want me to|shall i|should i|can i|could i|would you like|if you want|"
+                                   r"if you'd like)\b", s, re.I)]
+    if not sentences:
+        return False
+    if any(_SCHEDULING_TOOL_RE.search(n) for n in doers):
+        return False  # it was set up just now (a failed call isn't in doers)
+    work = _active_scheduled_work()
+    if not work:
+        return True
+    topic = (reqctx.content_words(" ".join(sentences)) | reqctx.content_words(transcript or "")) - _ONGOING_FILLER
+    if not topic:
+        return False  # "I'm still on it" about nothing in particular, and something is scheduled
+    return not any(reqctx.related(w, topic) for w in work)
+
+
 def _claim_nudge(what: list[str]) -> str:
+    if _ONGOING_UNBACKED in what:
+        return ("[system check] Your reply says you are monitoring something or will check again / let the user know "
+                "later, but nothing is scheduled for it (no job, watch, background agent, reminder or scheduled skill), "
+                "so nothing will happen. If the user asked for it, set it up now (schedule_jarvis_task for a repeated "
+                "check of something, watches for dated things in a file/calendar/mail/page). "
+                "Otherwise reply again and say plainly that nothing is running for it.")
     return ("[system check] Your reply says you did this: " + "; ".join(what) + ". But no tool that does "
             "that ran this turn, so it did NOT happen. If the user wants it, call the right tool now (use "
             "find_tools if you can't see one). If you can't do it, reply again and say so plainly, without "
@@ -13937,10 +14317,31 @@ def _narrowing_core(transcript: str, on_screen: bool = False) -> set[str]:
         core |= {"skills", "watches"}
     if _WATCH_RE.search(transcript or ""):
         core.add("watches")
+    if _SETTINGS_WORDS_RE.search(transcript or ""):
+        core.add("settings")
+    if _STOP_TASK_RE.search(transcript or ""):
+        core |= {"stop_background_task", "list_background_tasks"}
+    if _SCHEDULED_WORK_RE.search(transcript or ""):
+        core |= {"schedule_jarvis_task", "scheduled_jobs"}
     if re.search(r"\b(?:personality|personalities|voice type|vibe|attitude|gen ?z|pidgin|naija|playful|sarcastic|"
                  r"hype|tired mode|serious mode|classic mode|auto mode)\b", transcript or "", re.I):
         core.add("personality")
     return core
+
+
+_SETTINGS_WORDS_RE = re.compile(
+    r"\b(?:settings?|turn (?:on|off) (?:the )?[a-z ]{2,30}|enable|disable|switch (?:on|off)|wake word|follow[- ]?up|"
+    r"auto[- ]?reply|hotkey|push[- ]to[- ]talk|budget|notifications? (?:on|off))\b", re.I)
+_STOP_TASK_RE = re.compile(
+    r"\b(?:stop|cancel|kill|abort|end)\b.{0,40}\b(?:task|research|delegat\w*|background|plan|james|coding agent|"
+    r"that job|running)\b", re.I)
+
+# "set a scheduled work to check my speed every 5 mins", "check again in 10 minutes" (2026-10-16 debug report: the
+# model never saw schedule_jarvis_task under narrowing, tried watches/agents/skills and then claimed it was tracking).
+_SCHEDULED_WORK_RE = re.compile(
+    r"\bschedul\w*\s+(?:a\s+|some\s+)?(?:work|job|task)s?\b|\b(?:background|scheduled) (?:work|job|task)\b|"
+    r"\bevery\s+\d+\s*(?:min|mins|minutes?|hours?|hrs?)\b|\b(?:check|test|try|run) (?:it )?again\b|"
+    r"\bin\s+\d+\s*(?:min|mins|minutes?|hours?|hrs?)\b|\blater (?:on|today|tonight)\b", re.I)
 
 
 # "monitor my timetable and tell me when exams are near", "keep an eye on X", "let me know when..." (2026-10-06)
@@ -14303,7 +14704,9 @@ def _execute_tool_impl(
         elif tool_name == "open_app":
             app = str(inp.get("app") or "").strip().lower()
             app = APP_ALIASES.get(app, app)
-            if app in ALLOWED_APPS:
+            if app == "roblox":
+                result = _launch_roblox()
+            elif app in ALLOWED_APPS:
                 problem = _launch_app(app)
                 result = (f"Tool failed: couldn't open {app}: {problem}." if problem else
                           f"Opened {browsers.label() if app == 'browser' else app}.")
@@ -15583,7 +15986,8 @@ def run_agent_loop(transcript: str, tone: dict | None = None, narrate: bool = Fa
     # Reply cache: only ever populated by turns that used read-only tools exclusively (see the
     # store below), so a hit can only replay an informational answer, never skip an action.
     reply_key = None
-    if record_history and not image and cache.enabled("reply") and cache.is_self_contained(transcript):
+    if (record_history and not image and cache.enabled("reply") and cache.is_self_contained(transcript)
+            and not _open_asks_waiting()):
         reply_key = cache.stable_hash(
             cache.normalize_text(transcript),
             sleep_mode.system_prompt_context_line() + face.system_prompt_context_line()
@@ -15599,7 +16003,10 @@ def run_agent_loop(transcript: str, tone: dict | None = None, narrate: bool = Fa
     first: str | list = transcript if not image else [
         {"type": "image", "source": {"type": "base64", "media_type": image_type, "data": image}},
         {"type": "text", "text": transcript}]
-    messages: list[dict] = reqctx.pick_history(_history_snapshot(), transcript) + [{"role": "user", "content": first}]
+    # An unattended run (scheduled skill, queued task, watch, job: record_history=False) never sees the conversation:
+    # found live 2026-10-16, a scheduled Gmail check read the user's chat about a speed monitor and acted on it.
+    history = reqctx.pick_history(_history_snapshot(), transcript) if record_history else []
+    messages: list[dict] = history + [{"role": "user", "content": first}]
     reply_parts: list[str] = []
     last_tool_result_text = ""  # fallback if Claude ends a turn with only a tool call, no text
     narrated = 0
@@ -15649,6 +16056,10 @@ def run_agent_loop(transcript: str, tone: dict | None = None, narrate: bool = Fa
         smart = _llm_provider() == "claude"  # Claude's smart model gets thinking from round one
         log.info("Repeated command: escalating to %s: %r", model, transcript[:80])
     claim_nudged = False
+    # Tool results that need the user's answer (jarvis_asks, 2026-10-16): tool name -> {tool, input, questions}.
+    pending_asks: dict[str, dict] = {}
+    asks_nudged = False
+    shown_asks = list(getattr(_command_ctx, "shown_asks", None) or [])  # set by build_system_blocks above
     for iteration in range(MAX_AGENT_ITERATIONS):
         request_body = {
             "model": model,
@@ -15765,9 +16176,24 @@ def run_agent_loop(transcript: str, tone: dict | None = None, narrate: bool = Fa
                 continue
             if handoff_nudged and not set(used_tool_names) & _DELEGATION_TOOLS and _HANDOFF_CLAIM_RE.search(claim):
                 reply_parts.append("Correction: I did not actually start a background task for that. Ask me again to start it.")
-            unbacked = _unbacked_claims(claim, succeeded_tool_names)
+            if (pending_asks and not asks_nudged and iteration < MAX_AGENT_ITERATIONS - 1
+                    and _current_command_source() in asks_mod.ATTENDED  # a background run asks through the card
+                    and not asks_mod.reply_asks(claim, " ".join(p["questions"] for p in pending_asks.values()))):
+                # A tool said it needs the user's answer and the reply doesn't ask (found live 2026-10-16: the watch
+                # tool's questions were skipped and a speed test ran instead): one more round to ask them.
+                asks_nudged = True
+                log.warning("A tool needs the user's answer but the reply doesn't ask; nudging: %r", claim[:120])
+                del reply_parts[len(reply_parts) - len(texts):]
+                if streamed_this_round:
+                    _reset_reply_stream_spoken()
+                messages.append({"role": "user", "content": asks_mod.nudge(list(pending_asks.values()))})
+                continue
+            unbacked = _unbacked_claims(claim, succeeded_tool_names, transcript)
             if unbacked:
-                unbacked = _unbacked_claims(claim, succeeded_tool_names + _recent_succeeded_tools(transcript))
+                # Earlier commands can back "I sent it", never "I'm still monitoring it": a job scheduled half an hour
+                # ago may have run and stopped since (the ongoing check reads what is scheduled NOW instead).
+                ongoing = [u for u in unbacked if u == _ONGOING_UNBACKED]
+                unbacked = _unbacked_claims(claim, succeeded_tool_names + _recent_succeeded_tools(transcript)) + ongoing
             if unbacked and not claim_nudged and iteration < MAX_AGENT_ITERATIONS - 1:
                 claim_nudged = True
                 log.warning("Reply claims %s with no backing tool call; nudging: %r", unbacked, claim[:120])
@@ -15827,6 +16253,12 @@ def run_agent_loop(transcript: str, tone: dict | None = None, narrate: bool = Fa
             used_tool_names.append(tu.get("name", ""))
             if not _looks_failed(result_text) and not _looks_staged(result_text):
                 succeeded_tool_names.append(tu.get("name", ""))   # only these can back an "I did it" claim
+                pending_asks.pop(tu.get("name", ""), None)  # the same tool went through after all
+                _close_shown_asks(tu.get("name", ""), shown_asks)
+            question = asks_mod.needs_user(result_text)
+            if question:
+                pending_asks[tu.get("name", "")] = {"tool": tu.get("name", ""), "input": tu.get("input") or {},
+                                                    "questions": question}
             steps.append((tu.get("name", ""), json.dumps(tu.get("input") or {}, default=str)[:300], str(result_text)[:400]))
             any_tool_failed = any_tool_failed or _looks_failed(result_text)
         messages.append({"role": "user", "content": tool_results})
@@ -15854,6 +16286,8 @@ def run_agent_loop(transcript: str, tone: dict | None = None, narrate: bool = Fa
         and "james" not in reply.lower()
     ):
         _reply_cache.put(reply_key, reply, min(READONLY_TOOL_TTLS[n] for n in used_tool_names))
+    if pending_asks:
+        reply = _handle_pending_asks(transcript, reply, list(pending_asks.values()))
     if not reply and last_tool_result_text and tool_result_fallback:
         # Observed live: Claude sometimes ends a turn with only a tool call and no spoken text
         # at all — most consequentially for a staged catastrophic confirmation (run_shell/
